@@ -17,6 +17,7 @@ Private Const UD_MAX_CELLS As Long = 300000
 Private Const UD_MAX_CONFIG_BYTES As Long = 52428800
 Private Const UD_OLD_PREFIX As String = "UD_旧_"
 Private Const UD_NEW_PREFIX As String = "UD_新_"
+Private udAutomaticSheetPairCount As Long
 
 Public Sub RunUniversalDiff()
     Dim oldBookPath As Variant, newBookPath As Variant
@@ -162,7 +163,7 @@ End Sub
 Private Sub CompareExcelBooks(ByVal oldPath As String, ByVal newPath As String)
     Dim oldIndex As Object, newIndex As Object
     Dim oldSheetMap As Object, newSheetMap As Object
-    LoadSheetMappings oldSheetMap, newSheetMap
+    BuildEffectiveSheetMappings oldPath, newPath, oldSheetMap, newSheetMap
     Set oldIndex = LoadWorkbookIndex(oldPath, oldSheetMap)
     Set newIndex = LoadWorkbookIndex(newPath, newSheetMap)
 
@@ -349,31 +350,112 @@ Private Function EmptyExcelItem() As Variant
     EmptyExcelItem = Array("", "", "", "", "", "", "")
 End Function
 
-Private Sub LoadSheetMappings(ByRef oldMappings As Object, ByRef newMappings As Object)
+Private Sub BuildEffectiveSheetMappings(ByVal oldPath As String, ByVal newPath As String, _
+                                        ByRef oldMappings As Object, _
+                                        ByRef newMappings As Object)
     Set oldMappings = CreateObject("Scripting.Dictionary")
     Set newMappings = CreateObject("Scripting.Dictionary")
     oldMappings.CompareMode = vbTextCompare
     newMappings.CompareMode = vbTextCompare
-    If Not UDSheetExists(UD_SHEET_MAP) Then Exit Sub
-
-    Dim ws As Worksheet: Set ws = ThisWorkbook.Worksheets(UD_SHEET_MAP)
+    udAutomaticSheetPairCount = 0
+    Dim ws As Worksheet
     Dim lastRow As Long, rowNumber As Long, oldName As String, newName As String
-    lastRow = ws.Cells(ws.Rows.Count, 1).End(xlUp).Row
-    For rowNumber = 2 To lastRow
-        If IsRuleEnabled(CStr(ws.Cells(rowNumber, 1).Value2)) Then
-            oldName = NormalizeWhitespace(CStr(ws.Cells(rowNumber, 2).Value2))
-            newName = NormalizeWhitespace(CStr(ws.Cells(rowNumber, 3).Value2))
-            If oldName = "" Or newName = "" Then Err.Raise vbObjectError + 704, , _
-                "UD_シート対応表の" & rowNumber & "行目に空欄があります。"
-            If oldMappings.Exists(oldName) Then Err.Raise vbObjectError + 705, , _
-                "過去版シートが重複しています: " & oldName
-            If newMappings.Exists(newName) Then Err.Raise vbObjectError + 706, , _
-                "今回版シートが重複しています: " & newName
-            oldMappings.Add oldName, newName
-            newMappings.Add newName, newName
-        End If
-    Next rowNumber
+    If UDSheetExists(UD_SHEET_MAP) Then
+        Set ws = ThisWorkbook.Worksheets(UD_SHEET_MAP)
+        lastRow = ws.Cells(ws.Rows.Count, 1).End(xlUp).Row
+        For rowNumber = 2 To lastRow
+            If IsRuleEnabled(CStr(ws.Cells(rowNumber, 1).Value2)) Then
+                oldName = NormalizeWhitespace(CStr(ws.Cells(rowNumber, 2).Value2))
+                newName = NormalizeWhitespace(CStr(ws.Cells(rowNumber, 3).Value2))
+                If oldName = "" Or newName = "" Then Err.Raise vbObjectError + 704, , _
+                    "UD_シート対応表の" & rowNumber & "行目に空欄があります。"
+                If oldMappings.Exists(oldName) Then Err.Raise vbObjectError + 705, , _
+                    "過去版シートが重複しています: " & oldName
+                If newMappings.Exists(newName) Then Err.Raise vbObjectError + 706, , _
+                    "今回版シートが重複しています: " & newName
+                oldMappings.Add oldName, newName
+                newMappings.Add newName, newName
+            End If
+        Next rowNumber
+    End If
+
+    Dim oldSheets As Collection, newSheets As Collection
+    Set oldSheets = EligibleSheetNames(oldPath)
+    Set newSheets = EligibleSheetNames(newPath)
+    ValidateExplicitMappings oldSheets, newSheets, oldMappings, newMappings
+
+    Dim oldRemaining As Collection, newRemaining As Collection
+    Set oldRemaining = UnmappedSheetNames(oldSheets, oldMappings)
+    Set newRemaining = UnmappedSheetNames(newSheets, newMappings)
+    Dim pairCount As Long, index As Long
+    pairCount = oldRemaining.Count
+    If newRemaining.Count < pairCount Then pairCount = newRemaining.Count
+    For index = 1 To pairCount
+        oldName = CStr(oldRemaining(index))
+        newName = CStr(newRemaining(index))
+        oldMappings.Add oldName, newName
+        newMappings.Add newName, newName
+    Next index
+    udAutomaticSheetPairCount = pairCount
+    UDLog "INFO", "シート対応", _
+        "明示=" & EnabledSheetMappingCount() & ", 順番=" & pairCount
 End Sub
+
+Private Function EligibleSheetNames(ByVal workbookPath As String) As Collection
+    Dim result As New Collection, sourceBook As Workbook, ws As Worksheet
+    On Error GoTo ErrorHandler
+    Set sourceBook = Workbooks.Open(workbookPath, UpdateLinks:=0, ReadOnly:=True, _
+                                   AddToMru:=False, IgnoreReadOnlyRecommended:=True)
+    For Each ws In sourceBook.Worksheets
+        If ResolveExcelHandling(ws.Name, "") <> "比較除外" Then result.Add ws.Name
+    Next ws
+    sourceBook.Close SaveChanges:=False
+    Set EligibleSheetNames = result
+    Exit Function
+ErrorHandler:
+    Dim number As Long, description As String
+    number = Err.Number: description = Err.Description
+    On Error Resume Next
+    If Not sourceBook Is Nothing Then sourceBook.Close SaveChanges:=False
+    On Error GoTo 0
+    Err.Raise number, , description
+End Function
+
+Private Function UnmappedSheetNames(ByVal sourceNames As Collection, _
+                                    ByVal mappings As Object) As Collection
+    Dim result As New Collection, index As Long, sheetName As String
+    For index = 1 To sourceNames.Count
+        sheetName = CStr(sourceNames(index))
+        If Not mappings.Exists(sheetName) Then result.Add sheetName
+    Next index
+    Set UnmappedSheetNames = result
+End Function
+
+Private Sub ValidateExplicitMappings(ByVal oldSheets As Collection, _
+                                     ByVal newSheets As Collection, _
+                                     ByVal oldMappings As Object, _
+                                     ByVal newMappings As Object)
+    Dim availableOld As Object, availableNew As Object
+    Set availableOld = CollectionNameSet(oldSheets)
+    Set availableNew = CollectionNameSet(newSheets)
+    Dim key As Variant
+    For Each key In oldMappings.Keys
+        If Not availableOld.Exists(CStr(key)) Then Err.Raise vbObjectError + 707, , _
+            "対応表の過去版シートが見つかりません: " & CStr(key)
+        If Not availableNew.Exists(CStr(oldMappings(key))) Then Err.Raise vbObjectError + 708, , _
+            "対応表の今回版シートが見つかりません: " & CStr(oldMappings(key))
+    Next key
+End Sub
+
+Private Function CollectionNameSet(ByVal sourceNames As Collection) As Object
+    Dim result As Object: Set result = CreateObject("Scripting.Dictionary")
+    result.CompareMode = vbTextCompare
+    Dim index As Long
+    For index = 1 To sourceNames.Count
+        result(CStr(sourceNames(index))) = True
+    Next index
+    Set CollectionNameSet = result
+End Function
 
 Private Function ResolveComparisonSheetName(ByVal sourceSheetName As String, _
                                             ByVal sheetMappings As Object) As String
@@ -787,6 +869,7 @@ Private Sub BuildSummary(ByVal oldBookPath As String, ByVal newBookPath As Strin
     UDSummaryRow ws, rowNumber, "今回設計書", FileNameOnly(newBookPath)
     UDSummaryRow ws, rowNumber, "Excel差分件数", CStr(UDDataRowCount(UD_EXCEL))
     UDSummaryRow ws, rowNumber, "有効なシート対応", CStr(EnabledSheetMappingCount()) & "件"
+    UDSummaryRow ws, rowNumber, "順番による自動対応", CStr(udAutomaticSheetPairCount) & "組"
     UDSummaryRow ws, rowNumber, "色付きコピー", _
         "UD_旧_* と UD_新_* に作成（元ファイルは変更しません）"
     UDSummaryRow ws, rowNumber, "色の凡例", _
