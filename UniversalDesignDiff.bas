@@ -13,6 +13,7 @@ Private Const UD_CONFIG As String = "UD_Config差分"
 Private Const UD_RULES As String = "UD_比較ルール"
 Private Const UD_LOG As String = "UD_実行ログ"
 Private Const UD_MAX_CELLS As Long = 300000
+Private Const UD_MAX_CONFIG_BYTES As Long = 52428800
 
 Public Sub RunUniversalDiff()
     Dim oldBookPath As Variant, newBookPath As Variant
@@ -150,25 +151,21 @@ Private Sub CompareExcelBooks(ByVal oldPath As String, ByVal newPath As String)
     Set ws = ThisWorkbook.Worksheets(UD_EXCEL)
     outputRow = 2
 
-    ' 同じシート・セルを先に比較する。
+    ' 同じシート・セルで完全に同じものだけを先に確定する。
+    ' 値が異なるセルは、行挿入による移動の可能性があるため後で判定する。
     For Each key In newIndex.Keys
         If oldIndex.Exists(CStr(key)) Then
             oldItem = oldIndex(CStr(key))
             newItem = newIndex(CStr(key))
-            matchedOld(CStr(key)) = True
-            matchedNew(CStr(key)) = True
             handling = ResolveExcelHandling(CStr(newItem(0)), CStr(newItem(5)))
-            If handling <> "比較除外" Then
-                If CStr(oldItem(2)) = CStr(newItem(2)) And _
-                   CStr(oldItem(3)) = CStr(newItem(3)) Then
-                    result = "同一"
-                ElseIf CStr(oldItem(2)) = CStr(newItem(2)) Then
-                    result = "数式変更"
-                Else
-                    result = "変更"
-                End If
-                If result <> "同一" Then
-                    WriteExcelDiff ws, outputRow, result, handling, oldItem, newItem, _
+            If handling = "比較除外" Then
+                matchedOld(CStr(key)) = True
+                matchedNew(CStr(key)) = True
+            ElseIf CStr(oldItem(2)) = CStr(newItem(2)) Then
+                matchedOld(CStr(key)) = True
+                matchedNew(CStr(key)) = True
+                If CStr(oldItem(3)) <> CStr(newItem(3)) Then
+                    WriteExcelDiff ws, outputRow, "数式変更", handling, oldItem, newItem, _
                                    "高", CStr(key)
                 End If
             End If
@@ -180,7 +177,8 @@ Private Sub CompareExcelBooks(ByVal oldPath As String, ByVal newPath As String)
         If Not matchedOld.Exists(CStr(key)) Then
             oldItem = oldIndex(CStr(key))
             If CStr(oldItem(2)) <> "" Then AddCollectionItem oldByValue, _
-                CStr(oldItem(0)) & "|" & CStr(oldItem(2)), CStr(key)
+                CStr(oldItem(0)) & "|" & AddressColumn(CStr(oldItem(1))) & "|" & _
+                CStr(oldItem(2)), CStr(key)
         End If
     Next key
 
@@ -188,7 +186,8 @@ Private Sub CompareExcelBooks(ByVal oldPath As String, ByVal newPath As String)
     For Each key In newIndex.Keys
         If Not matchedNew.Exists(CStr(key)) Then
             newItem = newIndex(CStr(key))
-            candidateKey = CStr(newItem(0)) & "|" & CStr(newItem(2))
+            candidateKey = CStr(newItem(0)) & "|" & _
+                           AddressColumn(CStr(newItem(1))) & "|" & CStr(newItem(2))
             handling = ResolveExcelHandling(CStr(newItem(0)), CStr(newItem(5)))
             If handling = "比較除外" Then
                 matchedNew(CStr(key)) = True
@@ -201,6 +200,23 @@ Private Sub CompareExcelBooks(ByVal oldPath As String, ByVal newPath As String)
                     matchedNew(CStr(key)) = True
                     WriteExcelDiff ws, outputRow, "移動候補", handling, oldItem, _
                                    newItem, "中", oldLocationKey & "->" & CStr(key)
+                End If
+            End If
+        End If
+    Next key
+
+    ' 移動ではなかった同一場所の残余を変更として扱う。
+    For Each key In newIndex.Keys
+        If Not matchedNew.Exists(CStr(key)) And oldIndex.Exists(CStr(key)) Then
+            If Not matchedOld.Exists(CStr(key)) Then
+                oldItem = oldIndex(CStr(key))
+                newItem = newIndex(CStr(key))
+                handling = ResolveExcelHandling(CStr(newItem(0)), CStr(newItem(5)))
+                matchedOld(CStr(key)) = True
+                matchedNew(CStr(key)) = True
+                If handling <> "比較除外" Then
+                    WriteExcelDiff ws, outputRow, "変更", handling, oldItem, _
+                                   newItem, "高", CStr(key)
                 End If
             End If
         End If
@@ -339,23 +355,42 @@ Private Function LoadConfigLines(ByVal filePath As String) As Object
     Dim result As Object: Set result = CreateObject("Scripting.Dictionary")
     Dim fileNo As Integer, lineText As String, lineNumber As Long
     Dim normalized As String, handling As String, stored As String
+    Dim comparisonKey As String
+    Dim content As String, lines As Variant, index As Long, fileLength As Long
     On Error GoTo ErrorHandler
     fileNo = FreeFile
-    Open filePath For Input As #fileNo
-    Do Until EOF(fileNo)
-        Line Input #fileNo, lineText
-        lineNumber = lineNumber + 1
+    Open filePath For Binary Access Read As #fileNo
+    fileLength = LOF(fileNo)
+    If fileLength > UD_MAX_CONFIG_BYTES Then
+        Err.Raise vbObjectError + 702, , "Configが50MBの上限を超えています。"
+    End If
+    If fileLength > 0 Then
+        content = Space$(fileLength)
+        Get #fileNo, , content
+    End If
+    Close #fileNo
+    fileNo = 0
+    content = Replace(content, vbCrLf, vbLf)
+    content = Replace(content, vbCr, vbLf)
+    lines = Split(content, vbLf)
+    For index = LBound(lines) To UBound(lines)
+        lineNumber = index + 1
+        lineText = CStr(lines(index))
         normalized = NormalizeConfigLine(lineText)
         If normalized <> "" Then
             handling = ResolveConfigHandling(FileNameOnly(filePath), normalized)
             If handling <> "比較除外" Then
-                If handling = "秘密情報" Then normalized = MaskSensitiveLine(normalized)
+                comparisonKey = normalized
+                If handling = "秘密情報" Then
+                    comparisonKey = MaskSensitiveLine(normalized) & ChrW(&H1F) & _
+                                    SensitiveSignature(normalized)
+                    normalized = MaskSensitiveLine(normalized)
+                End If
                 stored = CStr(lineNumber) & "|" & MaskSensitiveLine(Trim$(lineText))
-                AddCollectionItem result, normalized, stored
+                AddCollectionItem result, comparisonKey, stored
             End If
         End If
-    Loop
-    Close #fileNo
+    Next index
     Set LoadConfigLines = result
     Exit Function
 ErrorHandler:
@@ -367,6 +402,18 @@ ErrorHandler:
     Err.Raise number, , description
 End Function
 
+Private Function AddressColumn(ByVal address As String) As String
+    Dim index As Long, character As String
+    For index = 1 To Len(address)
+        character = Mid$(address, index, 1)
+        If character Like "[A-Za-z]" Then
+            AddressColumn = AddressColumn & UCase$(character)
+        Else
+            Exit For
+        End If
+    Next index
+End Function
+
 Private Sub WriteConfigDiff(ByVal ws As Worksheet, ByRef rowNumber As Long, _
                             ByVal result As String, ByVal normalized As String, _
                             ByVal oldStored As String, ByVal newStored As String, _
@@ -374,8 +421,14 @@ Private Sub WriteConfigDiff(ByVal ws As Worksheet, ByRef rowNumber As Long, _
     Dim oldLine As String, oldText As String, newLine As String, newText As String
     SplitStoredLine oldStored, oldLine, oldText
     SplitStoredLine newStored, newLine, newText
-    Dim handling As String
-    handling = ResolveConfigHandling("*", normalized)
+    Dim handling As String, isSensitive As Boolean
+    isSensitive = (InStr(normalized, ChrW(&H1F)) > 0)
+    normalized = DisplayConfigKey(normalized)
+    If isSensitive Then
+        handling = "秘密情報"
+    Else
+        handling = ResolveConfigHandling("*", normalized)
+    End If
     ws.Cells(rowNumber, 1).Value2 = result
     ws.Cells(rowNumber, 2).Value2 = handling
     ws.Cells(rowNumber, 3).Value2 = normalized
@@ -384,9 +437,28 @@ Private Sub WriteConfigDiff(ByVal ws As Worksheet, ByRef rowNumber As Long, _
     ws.Cells(rowNumber, 6).Value2 = oldText
     ws.Cells(rowNumber, 7).Value2 = newText
     ws.Cells(rowNumber, 8).Value2 = IIf(handling = "秘密情報", "マスク済み", "")
-    ws.Cells(rowNumber, 9).Value2 = key
+    ws.Cells(rowNumber, 9).Value2 = DisplayConfigKey(key)
     rowNumber = rowNumber + 1
 End Sub
+
+Private Function DisplayConfigKey(ByVal comparisonKey As String) As String
+    Dim position As Long: position = InStr(comparisonKey, ChrW(&H1F))
+    If position > 0 Then
+        DisplayConfigKey = Left$(comparisonKey, position - 1)
+    Else
+        DisplayConfigKey = comparisonKey
+    End If
+End Function
+
+Private Function SensitiveSignature(ByVal value As String) As String
+    Dim hashValue As Double, index As Long
+    hashValue = 5381
+    For index = 1 To Len(value)
+        hashValue = hashValue * 33 + AscW(Mid$(value, index, 1))
+        hashValue = hashValue - Int(hashValue / 2000000000#) * 2000000000#
+    Next index
+    SensitiveSignature = Hex$(CLng(hashValue))
+End Function
 
 Private Sub SplitStoredLine(ByVal stored As String, ByRef lineNumber As String, _
                             ByRef lineText As String)
