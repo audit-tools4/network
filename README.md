@@ -1,78 +1,26 @@
-# FortiGate Network Design Checker
+# Network Design Diff
 
-## 汎用Diff版
+SW、AP、ルータ、Firewallなど、機器種別を問わず過去版と今回版の詳細設計書Excelを比較するVBAツールです。必要に応じて、過去Configと今回Configのテキスト差分も確認できます。
 
-SW、AP、ルータ、Firewallなど、機器種別を問わず過去・今回の詳細設計書とConfigを比較するVBA版を追加しました。
+通常利用では次の2ファイルだけを使用します。
 
-- [`UniversalDesignDiff.bas`](./UniversalDesignDiff.bas)
-- [`汎用Diffの導入・仕様`](./UNIVERSAL_DIFF_README.md)
+- [`UniversalDesignDiff.bas`](./UniversalDesignDiff.bas)：Excelへ貼り付けるVBA本体
+- [`UNIVERSAL_DIFF_README.md`](./UNIVERSAL_DIFF_README.md)：導入方法、使い方、判定、制限事項
 
-FortiGate固有の意味的な設計書・Config照合は、引き続き`FG60_SelfContained.bas`を使用します。
+## 主な機能
 
-FortiGateの詳細設計書Excelにある「ネットワーク」シートと、FortiGate configの`config system interface`をExcel VBAだけで照合する試作ツールです。
+- Excelの変更、追加、削除、数式変更、移動候補を検出
+- 過去版・今回版の色付きコピーを結果ブックへ生成
+- 対応表が空の場合は、比較対象シートを左から順番に対応
+- 必要な場合だけ`UD_シート対応表`で異なる順番や名称を明示対応
+- 表紙、改訂履歴、拠点固有値などの比較ルール
+- メーカー非依存のConfig行差分と秘密情報マスク
+- Python、PowerShell、外部ライブラリ、外部通信不要
 
-Python、PowerShell、外部ライブラリ、外部通信は使用しません。
+## FortiGate専用試作版
 
-## 会社PCへの導入
-
-1. GitHubで[`FG60_SelfContained.bas`](./FG60_SelfContained.bas)を開く。
-2. コードの先頭から末尾までコピーする。
-3. 会社PCで空のExcelブックを作成し、`.xlsm`形式で保存する。
-4. `Alt + F11`を押す。
-5. VBAエディターで「挿入」→「標準モジュール」を選ぶ。
-6. コピーしたコードを貼り付けて保存する。
-7. `Alt + F8`から`RunAllChecks`を実行する。
-8. 詳細設計書Excel、FortiGate configの順に選択する。
-9. `FG_比較結果`シートを確認する。
-
-`.bas`ファイルをダウンロードする必要はありません。GitHubのコード表示からコピーして貼り付けられます。
-
-## 初期対象
-
-詳細設計書の「ネットワーク」シートから、次の項目を抽出します。
-
-- インターフェース名
-- エイリアス
-- VLANタイプ、親インターフェース、VLAN ID
-- VDOM
-- VRF ID
-- ロール
-- アドレッシングモード
-- IP／ネットマスク
-- セカンダリIPの有効・無効
-- 管理者アクセスIPv4
-- LLDP受信・送信
-- ステータス
-
-config側は`config system interface`を解析します。
-
-## 判定
-
-- `一致`
-- `一致(未設定)`
-- `不一致`
-- `CONFIGオブジェクトなし`
-- `CONFIG未記載`
-- `要確認(省略可能)`
-
-通常の`show`ではFortiGateのデフォルト値が省略される場合があります。可能であれば`show full-configuration`またはバックアップconfigを使用してください。
-
-## 初期版の対象外
-
-- DHCPサーバ
-- アドレスオブジェクトの自動作成
-- セキュリティモード、認証ポータル
-- Explicit Web／FTP Proxy
-- アウトバンドシェイピング
-- SD-WAN、IPsec、Firewall Policy
-
-## 安全性
-
-- 詳細設計書は読み取り専用で開き、保存せず閉じます。
-- configは読み取りのみで、変更しません。
-- 外部通信しません。
-- VBAコードには会社固有のIPアドレス、装置名、パスワード、PSK、APIトークンを含めないでください。
+FortiGateの詳細設計書と`config system interface`を照合する旧試作版は、通常利用から分離して[`fortigate-specific`](./fortigate-specific/)へ移動しました。汎用Diffを使用するだけなら、このフォルダは不要です。
 
 ## 注意
 
-これは初期版です。本番利用前に匿名化した設計書とconfigで動作確認し、意図的な不一致を正しく検出できることを確認してください。
+差分はレビュー候補です。設定の妥当性やメーカー固有の意味までは保証しないため、本番前に匿名化したテストファイルで確認してください。
