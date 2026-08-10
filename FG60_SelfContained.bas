@@ -22,6 +22,12 @@ Public Sub RunAllChecks()
         "FortiGate config,*.conf;*.txt;*.cfg;*.*", , "FortiGate configを選択")
     If VarType(configPath) = vbBoolean Then Exit Sub
 
+    RunChecksFromPaths CStr(designPath), CStr(configPath), True
+End Sub
+
+Public Sub RunChecksFromPaths(ByVal designPath As String, ByVal configPath As String, _
+                              Optional ByVal showMessage As Boolean = True)
+
     Dim oldScreen As Boolean, oldEvents As Boolean
     Dim oldAlerts As Boolean, oldCalculation As XlCalculation
     Dim oldSecurity As Long
@@ -41,15 +47,16 @@ Public Sub RunAllChecks()
     On Error GoTo ErrorHandler
 
     InitializeSheets
-    LogMessage "INFO", "処理開始", "Design=" & CStr(designPath)
-    ExtractNetworkSheet CStr(designPath)
-    ExtractRoutingSheet CStr(designPath)
-    ParseFortiGateConfig CStr(configPath)
+    LogMessage "INFO", "処理開始", "Design=" & designPath
+    ExtractNetworkSheet designPath
+    ExtractRoutingSheet designPath
+    ParseFortiGateConfig configPath
     CompareNormalizedData
     FormatAllSheets
 
     ThisWorkbook.Worksheets(SHEET_RESULT).Activate
-    MsgBox "照合が完了しました。FG_比較結果を確認してください。", vbInformation
+    If showMessage Then _
+        MsgBox "照合が完了しました。FG_比較結果を確認してください。", vbInformation
 
 CleanExit:
     Application.AutomationSecurity = oldSecurity
@@ -61,7 +68,8 @@ CleanExit:
 
 ErrorHandler:
     LogMessage "ERROR", "処理中断", Err.Number & ": " & Err.Description
-    MsgBox "処理中にエラーが発生しました。" & vbCrLf & Err.Description, vbExclamation
+    If showMessage Then _
+        MsgBox "処理中にエラーが発生しました。" & vbCrLf & Err.Description, vbExclamation
     Resume CleanExit
 End Sub
 

@@ -18,6 +18,12 @@ Python、PowerShell、外部ライブラリ、外部通信は使用しません�
 
 `.bas`ファイルをダウンロードする必要はありません。GitHubのコード表示からコピーして貼り付けられます。
 
+ファイル選択画面を使わずテストする場合は、VBAのイミディエイトウィンドウから次の形でも実行できます。
+
+```vb
+RunChecksFromPaths "C:\test\design.xlsx", "C:\test\fortigate.conf", True
+```
+
 ## 初期対象
 
 詳細設計書の「ネットワーク」シートから、次の項目を抽出します。
