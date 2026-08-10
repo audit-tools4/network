@@ -1,6 +1,6 @@
 Option Explicit
 
-' FortiGate詳細設計書（ネットワークシート）とconfig system interfaceの照合ツール
+' FortiGate詳細設計書（ネットワーク／ルーティングシート）とconfigの照合ツール
 ' 標準モジュールへ、このファイル全体をそのまま貼り付けてください。
 ' Python、PowerShell、外部ライブラリ、外部通信は使用しません。
 
@@ -9,6 +9,7 @@ Private Const SHEET_CONFIG As String = "FG_Config正規化"
 Private Const SHEET_RESULT As String = "FG_比較結果"
 Private Const SHEET_LOG As String = "FG_実行ログ"
 Private Const SECTION_INTERFACE As String = "system interface"
+Private Const SECTION_STATIC_ROUTE As String = "router static"
 
 Public Sub RunAllChecks()
     Dim designPath As Variant, configPath As Variant
@@ -42,6 +43,7 @@ Public Sub RunAllChecks()
     InitializeSheets
     LogMessage "INFO", "処理開始", "Design=" & CStr(designPath)
     ExtractNetworkSheet CStr(designPath)
+    ExtractRoutingSheet CStr(designPath)
     ParseFortiGateConfig CStr(configPath)
     CompareNormalizedData
     FormatAllSheets
@@ -62,6 +64,150 @@ ErrorHandler:
     MsgBox "処理中にエラーが発生しました。" & vbCrLf & Err.Description, vbExclamation
     Resume CleanExit
 End Sub
+
+Private Sub ExtractRoutingSheet(ByVal workbookPath As String)
+    Dim sourceBook As Workbook, sourceSheet As Worksheet, outputSheet As Worksheet
+    Dim outputRow As Long, rowNumber As Long, blockEnd As Long
+    Dim lastRow As Long, routeCount As Long, sectionEnd As Long
+    Set outputSheet = ThisWorkbook.Worksheets(SHEET_DESIGN)
+
+    On Error GoTo ErrorHandler
+    Set sourceBook = Workbooks.Open( _
+        Filename:=workbookPath, UpdateLinks:=0, ReadOnly:=True, _
+        AddToMru:=False, IgnoreReadOnlyRecommended:=True)
+
+    On Error Resume Next
+    Set sourceSheet = sourceBook.Worksheets("ルーティング")
+    On Error GoTo ErrorHandler
+    If sourceSheet Is Nothing Then
+        LogMessage "WARN", "ルーティング抽出", "ルーティングシートなし（スキップ）"
+        GoTo CleanExit
+    End If
+
+    lastRow = sourceSheet.Cells(sourceSheet.Rows.Count, "C").End(xlUp).Row
+    sectionEnd = lastRow
+    For rowNumber = 1 To lastRow
+        If InStr(1, NormalizeText(ReadMerged(sourceSheet.Cells(rowNumber, "B"))), _
+                 "BGP", vbTextCompare) > 0 Then
+            sectionEnd = rowNumber - 1
+            Exit For
+        End If
+    Next rowNumber
+
+    outputRow = outputSheet.Cells(outputSheet.Rows.Count, 1).End(xlUp).Row + 1
+    For rowNumber = 1 To sectionEnd
+        If Left$(NormalizeText(ReadMerged(sourceSheet.Cells(rowNumber, "C"))), 5) = "VDOM【" Then
+            blockEnd = FindNextVdomRow(sourceSheet, rowNumber, sectionEnd)
+            ExtractStaticRouteBlock sourceSheet, rowNumber, blockEnd, _
+                                    outputSheet, outputRow
+            routeCount = routeCount + 1
+        End If
+    Next rowNumber
+
+    LogMessage "INFO", "ルーティング抽出", _
+        "StaticRoutes=" & routeCount & ", TotalDesignParameters=" & (outputRow - 2)
+
+CleanExit:
+    On Error Resume Next
+    If Not sourceBook Is Nothing Then sourceBook.Close SaveChanges:=False
+    On Error GoTo 0
+    Exit Sub
+
+ErrorHandler:
+    Dim errorNumber As Long, errorDescription As String
+    errorNumber = Err.Number
+    errorDescription = Err.Description
+    ResumeAfterClose sourceBook
+    Err.Raise errorNumber, , errorDescription
+End Sub
+
+Private Function FindNextVdomRow(ByVal ws As Worksheet, ByVal startRow As Long, _
+                                 ByVal sectionEnd As Long) As Long
+    Dim rowNumber As Long
+    For rowNumber = startRow + 1 To sectionEnd
+        If Left$(NormalizeText(ReadMerged(ws.Cells(rowNumber, "C"))), 5) = "VDOM【" Then
+            FindNextVdomRow = rowNumber - 1
+            Exit Function
+        End If
+    Next rowNumber
+    FindNextVdomRow = sectionEnd
+End Function
+
+Private Sub ExtractStaticRouteBlock(ByVal ws As Worksheet, ByVal startRow As Long, _
+                                    ByVal endRow As Long, ByVal outputSheet As Worksheet, _
+                                    ByRef outputRow As Long)
+    Dim heading As String, vdom As String, destination As String
+    Dim gateway As String, device As String, distance As String
+    Dim comment As String, status As String, location As String, objectKey As String
+
+    heading = NormalizeText(ReadMerged(ws.Cells(startRow, "C")))
+    vdom = Replace(Replace(heading, "VDOM【", ""), "】", "")
+    destination = NormalizeIpMask(GetRoutingLabelValue(ws, startRow, endRow, "宛先", location))
+    gateway = GetRoutingLabelValue(ws, startRow, endRow, "ゲートウェイアドレス", location)
+    device = GetRoutingLabelValue(ws, startRow, endRow, "インターフェース", location)
+    distance = GetRoutingLabelValue(ws, startRow, endRow, _
+                             "アドミニストレーティブ・ディスタンス", location)
+    comment = GetRoutingLabelValue(ws, startRow, endRow, "コメント", location)
+    status = MapRouteStatus(SelectedLabel(ws, _
+                 FindLabelRow(ws, startRow, endRow, "ステータス")))
+
+    If destination = "" Then Exit Sub
+    objectKey = BuildStaticRouteObjectKey(destination, gateway, device)
+    AddDesignParameter outputSheet, outputRow, vdom, SECTION_STATIC_ROUTE, _
+        objectKey, "dst", destination, "ip-mask", "error", _
+        FindRoutingLabelLocation(ws, startRow, endRow, "宛先"), "経路識別キーの一部"
+    AddDesignParameter outputSheet, outputRow, vdom, SECTION_STATIC_ROUTE, _
+        objectKey, "gateway", gateway, "exact", "error", _
+        FindRoutingLabelLocation(ws, startRow, endRow, "ゲートウェイアドレス"), "経路識別キーの一部"
+    AddDesignParameter outputSheet, outputRow, vdom, SECTION_STATIC_ROUTE, _
+        objectKey, "device", device, "exact", "error", _
+        FindRoutingLabelLocation(ws, startRow, endRow, "インターフェース"), "経路識別キーの一部"
+    AddDesignParameter outputSheet, outputRow, vdom, SECTION_STATIC_ROUTE, _
+        objectKey, "distance", distance, "exact", "default-review", _
+        FindRoutingLabelLocation(ws, startRow, endRow, _
+        "アドミニストレーティブ・ディスタンス"), "FortiOS既定値は10"
+    AddDesignParameter outputSheet, outputRow, vdom, SECTION_STATIC_ROUTE, _
+        objectKey, "comment", comment, "exact", "empty-is-match", _
+        FindRoutingLabelLocation(ws, startRow, endRow, "コメント"), ""
+    AddDesignParameter outputSheet, outputRow, vdom, SECTION_STATIC_ROUTE, _
+        objectKey, "status", status, "exact", "default-review", _
+        FindRoutingLabelLocation(ws, startRow, endRow, "ステータス"), "FortiOS既定値はenable"
+End Sub
+
+Private Function GetRoutingLabelValue(ByVal ws As Worksheet, ByVal startRow As Long, _
+                                      ByVal endRow As Long, ByVal label As String, _
+                                      ByRef location As String) As String
+    Dim rowNumber As Long
+    rowNumber = FindLabelRow(ws, startRow, endRow, label)
+    If rowNumber > 0 Then
+        location = CellLocation(ws, rowNumber, 14)
+        GetRoutingLabelValue = NormalizeText(ReadMerged(ws.Cells(rowNumber, 14)))
+    End If
+End Function
+
+Private Function FindRoutingLabelLocation(ByVal ws As Worksheet, _
+                                          ByVal startRow As Long, _
+                                          ByVal endRow As Long, _
+                                          ByVal label As String) As String
+    Dim rowNumber As Long
+    rowNumber = FindLabelRow(ws, startRow, endRow, label)
+    If rowNumber > 0 Then FindRoutingLabelLocation = CellLocation(ws, rowNumber, 14)
+End Function
+
+Private Function MapRouteStatus(ByVal value As String) As String
+    Select Case value
+        Case "有効化済み", "有効": MapRouteStatus = "enable"
+        Case "無効化済み", "無効": MapRouteStatus = "disable"
+    End Select
+End Function
+
+Private Function BuildStaticRouteObjectKey(ByVal destination As String, _
+                                           ByVal gateway As String, _
+                                           ByVal device As String) As String
+    BuildStaticRouteObjectKey = NormalizeIpMask(destination) & "|" & _
+                                LCase$(NormalizeText(gateway)) & "|" & _
+                                LCase$(NormalizeText(device))
+End Function
 
 Public Sub InitializeSheets()
     PrepareSheet SHEET_DESIGN, Array( _
@@ -267,10 +413,20 @@ Private Sub AddDesignRow(ByVal ws As Worksheet, ByRef outputRow As Long, _
                          ByVal compareMode As String, ByVal missingPolicy As String, _
                          ByVal sourceLocation As String, ByVal note As String)
     If value = "" And parameter = "alias" Then Exit Sub
+    AddDesignParameter ws, outputRow, vdom, SECTION_INTERFACE, objectKey, _
+                       parameter, value, compareMode, missingPolicy, _
+                       sourceLocation, note
+End Sub
 
+Private Sub AddDesignParameter(ByVal ws As Worksheet, ByRef outputRow As Long, _
+                               ByVal vdom As String, ByVal section As String, _
+                               ByVal objectKey As String, ByVal parameter As String, _
+                               ByVal value As String, ByVal compareMode As String, _
+                               ByVal missingPolicy As String, _
+                               ByVal sourceLocation As String, ByVal note As String)
     WriteText ws.Cells(outputRow, 1), "FG60"
     WriteText ws.Cells(outputRow, 2), vdom
-    WriteText ws.Cells(outputRow, 3), SECTION_INTERFACE
+    WriteText ws.Cells(outputRow, 3), section
     WriteText ws.Cells(outputRow, 4), objectKey
     WriteText ws.Cells(outputRow, 5), parameter
     WriteText ws.Cells(outputRow, 6), value
@@ -278,7 +434,7 @@ Private Sub AddDesignRow(ByVal ws As Worksheet, ByRef outputRow As Long, _
     WriteText ws.Cells(outputRow, 8), missingPolicy
     WriteText ws.Cells(outputRow, 9), sourceLocation
     WriteText ws.Cells(outputRow, 10), note
-    WriteText ws.Cells(outputRow, 11), BuildKey(vdom, SECTION_INTERFACE, objectKey, parameter)
+    WriteText ws.Cells(outputRow, 11), BuildKey(vdom, section, objectKey, parameter)
     outputRow = outputRow + 1
 End Sub
 
@@ -409,7 +565,9 @@ Private Sub ParseFortiGateConfig(ByVal configPath As String)
     Dim lineNumber As Long, outputRow As Long
     Dim savedErrorNumber As Long, savedErrorDescription As String
     Dim sections As New Collection
-    Dim currentObject As String, objectDepth As Long, editLine As Long
+    Dim currentObject As String, currentObjectSection As String
+    Dim objectDepth As Long, editLine As Long
+    Dim currentVdom As String, vdomDepth As Long
     Dim params As Object, locations As Object
 
     outputRow = 2
@@ -426,8 +584,13 @@ Private Sub ParseFortiGateConfig(ByVal configPath As String)
             sections.Add LCase$(Trim$(Mid$(trimmed, 8)))
 
         ElseIf Left$(trimmed, 5) = "edit " Then
-            If CurrentSection(sections) = SECTION_INTERFACE Then
+            If CurrentSection(sections) = "vdom" And currentObject = "" Then
+                currentVdom = Unquote(Trim$(Mid$(trimmed, 6)))
+                vdomDepth = sections.Count
+            ElseIf CurrentSection(sections) = SECTION_INTERFACE _
+                Or CurrentSection(sections) = SECTION_STATIC_ROUTE Then
                 currentObject = Unquote(Trim$(Mid$(trimmed, 6)))
+                currentObjectSection = CurrentSection(sections)
                 objectDepth = sections.Count
                 editLine = lineNumber
                 Set params = CreateObject("Scripting.Dictionary")
@@ -459,11 +622,16 @@ Private Sub ParseFortiGateConfig(ByVal configPath As String)
 
         ElseIf trimmed = "next" Then
             If currentObject <> "" And sections.Count = objectDepth Then
-                FlushConfigInterface ws, outputRow, currentObject, editLine, params, locations
+                FlushConfigObject ws, outputRow, currentVdom, currentObjectSection, _
+                                  currentObject, editLine, params, locations
                 currentObject = ""
+                currentObjectSection = ""
                 objectDepth = 0
                 Set params = Nothing
                 Set locations = Nothing
+            ElseIf currentVdom <> "" And sections.Count = vdomDepth Then
+                currentVdom = ""
+                vdomDepth = 0
             End If
 
         ElseIf trimmed = "end" Then
@@ -539,36 +707,55 @@ Private Sub SplitCommandBody(ByVal body As String, ByRef parameter As String, _
     End If
 End Sub
 
-Private Sub FlushConfigInterface(ByVal ws As Worksheet, ByRef outputRow As Long, _
-                                 ByVal objectName As String, ByVal editLine As Long, _
-                                 ByVal params As Object, ByVal locations As Object)
-    Dim vdom As String
-    vdom = "root"
-    If params.Exists("vdom") Then vdom = CStr(params("vdom"))
+Private Sub FlushConfigObject(ByVal ws As Worksheet, ByRef outputRow As Long, _
+                              ByVal outerVdom As String, ByVal section As String, _
+                              ByVal editName As String, ByVal editLine As Long, _
+                              ByVal params As Object, ByVal locations As Object)
+    Dim vdom As String, objectName As String
+    vdom = outerVdom
+    If vdom = "" Then vdom = "root"
+    If section = SECTION_INTERFACE And params.Exists("vdom") Then _
+        vdom = CStr(params("vdom"))
 
-    AddConfigRow ws, outputRow, vdom, objectName, "_exists", "true", editLine
+    objectName = editName
+    If section = SECTION_STATIC_ROUTE Then
+        If Not params.Exists("dst") Then params("dst") = "0.0.0.0 0.0.0.0"
+        If Not params.Exists("gateway") Then params("gateway") = ""
+        If Not params.Exists("device") Then params("device") = ""
+        If Not params.Exists("distance") Then params("distance") = "10"
+        If Not params.Exists("status") Then params("status") = "enable"
+        objectName = BuildStaticRouteObjectKey(CStr(params("dst")), _
+                     CStr(params("gateway")), CStr(params("device")))
+    End If
+
+    AddConfigParameter ws, outputRow, vdom, section, objectName, _
+                       "_exists", "true", editLine
 
     Dim parameter As Variant
     For Each parameter In params.Keys
-        If IsComparisonParameter(CStr(parameter)) Then
-            AddConfigRow ws, outputRow, vdom, objectName, CStr(parameter), _
-                CStr(params(parameter)), CLng(locations(parameter))
+        If IsComparisonParameter(section, CStr(parameter)) Then
+            Dim parameterLine As Long
+            parameterLine = editLine
+            If locations.Exists(CStr(parameter)) Then _
+                parameterLine = CLng(locations(parameter))
+            AddConfigParameter ws, outputRow, vdom, section, objectName, _
+                CStr(parameter), CStr(params(parameter)), parameterLine
         End If
     Next parameter
 End Sub
 
-Private Sub AddConfigRow(ByVal ws As Worksheet, ByRef outputRow As Long, _
-                         ByVal vdom As String, ByVal objectKey As String, _
-                         ByVal parameter As String, ByVal value As String, _
-                         ByVal lineNumber As Long)
+Private Sub AddConfigParameter(ByVal ws As Worksheet, ByRef outputRow As Long, _
+                               ByVal vdom As String, ByVal section As String, _
+                               ByVal objectKey As String, ByVal parameter As String, _
+                               ByVal value As String, ByVal lineNumber As Long)
     WriteText ws.Cells(outputRow, 1), "FG60"
     WriteText ws.Cells(outputRow, 2), vdom
-    WriteText ws.Cells(outputRow, 3), SECTION_INTERFACE
+    WriteText ws.Cells(outputRow, 3), section
     WriteText ws.Cells(outputRow, 4), objectKey
     WriteText ws.Cells(outputRow, 5), parameter
     WriteText ws.Cells(outputRow, 6), value
     WriteText ws.Cells(outputRow, 7), "config line " & lineNumber
-    WriteText ws.Cells(outputRow, 8), BuildKey(vdom, SECTION_INTERFACE, objectKey, parameter)
+    WriteText ws.Cells(outputRow, 8), BuildKey(vdom, section, objectKey, parameter)
     outputRow = outputRow + 1
 End Sub
 
@@ -665,13 +852,21 @@ Private Function CanonicalParameter(ByVal parameter As String) As String
     End Select
 End Function
 
-Private Function IsComparisonParameter(ByVal parameter As String) As Boolean
-    Select Case parameter
-        Case "alias", "type", "interface", "vlanid", "vdom", "vrf", _
-             "role", "mode", "ip", "secondary-IP", "allowaccess", _
-             "lldp-reception", "lldp-transmission", "status"
-            IsComparisonParameter = True
-    End Select
+Private Function IsComparisonParameter(ByVal section As String, _
+                                       ByVal parameter As String) As Boolean
+    If section = SECTION_INTERFACE Then
+        Select Case parameter
+            Case "alias", "type", "interface", "vlanid", "vdom", "vrf", _
+                 "role", "mode", "ip", "secondary-IP", "allowaccess", _
+                 "lldp-reception", "lldp-transmission", "status"
+                IsComparisonParameter = True
+        End Select
+    ElseIf section = SECTION_STATIC_ROUTE Then
+        Select Case parameter
+            Case "dst", "gateway", "device", "distance", "comment", "status"
+                IsComparisonParameter = True
+        End Select
+    End If
 End Function
 
 Private Function NormalizeConfigValue(ByVal parameter As String, _
@@ -686,6 +881,8 @@ Private Function NormalizeConfigValue(ByVal parameter As String, _
             values(LCase$(CStr(token))) = True
         Next token
         NormalizeConfigValue = SortedDictionaryKeys(values)
+    ElseIf parameter = "ip" Or parameter = "dst" Then
+        NormalizeConfigValue = NormalizeIpMask(JoinTokens(tokens, " "))
     Else
         NormalizeConfigValue = JoinTokens(tokens, " ")
     End If
@@ -765,7 +962,38 @@ Private Function NormalizeText(ByVal value As Variant) As String
 End Function
 
 Private Function NormalizeIpMask(ByVal value As String) As String
-    NormalizeIpMask = NormalizeText(value)
+    Dim normalized As String, slashPosition As Long
+    Dim prefixLength As Long, addressPart As String
+    normalized = NormalizeText(value)
+    slashPosition = InStr(normalized, "/")
+    If slashPosition > 0 Then
+        addressPart = Left$(normalized, slashPosition - 1)
+        prefixLength = Val(Mid$(normalized, slashPosition + 1))
+        If prefixLength >= 0 And prefixLength <= 32 Then
+            NormalizeIpMask = addressPart & " " & PrefixToMask(prefixLength)
+            Exit Function
+        End If
+    End If
+    NormalizeIpMask = normalized
+End Function
+
+Private Function PrefixToMask(ByVal prefixLength As Long) As String
+    Dim octet As Long, remaining As Long, value As Long, result As String
+    remaining = prefixLength
+    For octet = 1 To 4
+        If remaining >= 8 Then
+            value = 255
+            remaining = remaining - 8
+        ElseIf remaining > 0 Then
+            value = 256 - (2 ^ (8 - remaining))
+            remaining = 0
+        Else
+            value = 0
+        End If
+        If result <> "" Then result = result & "."
+        result = result & CStr(value)
+    Next octet
+    PrefixToMask = result
 End Function
 
 Private Function Unquote(ByVal value As String) As String
