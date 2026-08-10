@@ -11,6 +11,7 @@ Private Const UD_SUMMARY As String = "UD_サマリ"
 Private Const UD_EXCEL As String = "UD_Excel差分"
 Private Const UD_CONFIG As String = "UD_Config差分"
 Private Const UD_RULES As String = "UD_比較ルール"
+Private Const UD_SHEET_MAP As String = "UD_シート対応表"
 Private Const UD_LOG As String = "UD_実行ログ"
 Private Const UD_MAX_CELLS As Long = 300000
 Private Const UD_MAX_CONFIG_BYTES As Long = 52428800
@@ -96,6 +97,22 @@ Public Sub ResetUniversalRules()
     InitializeUniversalRules True
 End Sub
 
+Public Sub ResetSheetMappings()
+    InitializeSheetMappings True
+End Sub
+
+Private Sub InitializeSheetMappings(ByVal showMessage As Boolean)
+    Dim ws As Worksheet
+    Set ws = UDGetOrCreateSheet(UD_SHEET_MAP)
+    If ws.AutoFilterMode Then ws.AutoFilterMode = False
+    ws.Cells.Clear
+    UDWriteHeaders ws, Array("有効", "過去版シート名", "今回版シート名", "用途・説明")
+    ws.Cells(2, 4).Value2 = "異なるシート名を対応させる場合だけ登録。未登録は同名シートで比較"
+    UDFormatTable ws, 4
+    If showMessage Then _
+        MsgBox "UD_シート対応表を初期化しました。過去版と今回版のシート名を登録してください。", vbInformation
+End Sub
+
 Private Sub InitializeUniversalRules(ByVal showMessage As Boolean)
     Dim ws As Worksheet
     Set ws = UDGetOrCreateSheet(UD_RULES)
@@ -132,18 +149,22 @@ Private Sub PrepareUniversalSheets()
     UDPrepareSheet UD_SUMMARY, Array("項目", "値")
     UDPrepareSheet UD_EXCEL, Array( _
         "判定", "扱い", "シート", "項目候補", "過去場所", "今回場所", _
-        "過去値", "今回値", "過去数式", "今回数式", "確度", "キー")
+        "過去値", "今回値", "過去数式", "今回数式", "確度", "キー", _
+        "過去シート", "今回シート")
     UDPrepareSheet UD_CONFIG, Array( _
         "判定", "扱い", "正規化行", "過去行", "今回行", _
         "過去内容", "今回内容", "秘密情報", "キー")
     UDPrepareSheet UD_LOG, Array("日時", "レベル", "処理", "内容")
     If Not UDSheetExists(UD_RULES) Then InitializeUniversalRules False
+    If Not UDSheetExists(UD_SHEET_MAP) Then InitializeSheetMappings False
 End Sub
 
 Private Sub CompareExcelBooks(ByVal oldPath As String, ByVal newPath As String)
     Dim oldIndex As Object, newIndex As Object
-    Set oldIndex = LoadWorkbookIndex(oldPath)
-    Set newIndex = LoadWorkbookIndex(newPath)
+    Dim oldSheetMap As Object, newSheetMap As Object
+    LoadSheetMappings oldSheetMap, newSheetMap
+    Set oldIndex = LoadWorkbookIndex(oldPath, oldSheetMap)
+    Set newIndex = LoadWorkbookIndex(newPath, newSheetMap)
 
     Dim matchedOld As Object, matchedNew As Object, oldByValue As Object
     Set matchedOld = CreateObject("Scripting.Dictionary")
@@ -250,11 +271,12 @@ Private Sub CompareExcelBooks(ByVal oldPath As String, ByVal newPath As String)
     UDLog "INFO", "Excel比較", "差分=" & (outputRow - 2)
 End Sub
 
-Private Function LoadWorkbookIndex(ByVal workbookPath As String) As Object
+Private Function LoadWorkbookIndex(ByVal workbookPath As String, _
+                                   ByVal sheetMappings As Object) As Object
     Dim result As Object: Set result = CreateObject("Scripting.Dictionary")
     Dim sourceBook As Workbook, ws As Worksheet, used As Range, cell As Range
     Dim totalCells As Double, key As String, value As String, formula As String
-    Dim address As String, label As String, item As Variant
+    Dim address As String, label As String, item As Variant, comparisonSheet As String
     On Error GoTo ErrorHandler
     Set sourceBook = Workbooks.Open(workbookPath, UpdateLinks:=0, ReadOnly:=True, _
                                    AddToMru:=False, IgnoreReadOnlyRecommended:=True)
@@ -266,6 +288,7 @@ Private Function LoadWorkbookIndex(ByVal workbookPath As String) As Object
                 "比較セル数が上限を超えました。不要シートを比較ルールで除外するか、UsedRangeを整理してください。"
         End If
         If ResolveExcelHandling(ws.Name, "") <> "比較除外" Then
+            comparisonSheet = ResolveComparisonSheetName(ws.Name, sheetMappings)
             For Each cell In used.Cells
                 If IsMergeAnchor(cell) Then
                     value = NormalizeCellValue(cell.Value2)
@@ -273,10 +296,13 @@ Private Function LoadWorkbookIndex(ByVal workbookPath As String) As Object
                     If value <> "" Or formula <> "" Then
                         address = cell.Address(False, False)
                         label = FindRowLabel(ws, cell.Row, cell.Column)
-                        key = ws.Name & "|" & address
-                        item = Array(ws.Name, address, value, formula, _
-                                     CellDisplayValue(cell), label)
-                        result(key) = item
+                        key = comparisonSheet & "|" & address
+                        item = Array(comparisonSheet, address, value, formula, _
+                                     CellDisplayValue(cell), label, ws.Name)
+                        If result.Exists(key) Then Err.Raise vbObjectError + 703, , _
+                            "シート対応後の比較キーが重複しました: " & key & _
+                            "。UD_シート対応表を確認してください。"
+                        result.Add key, item
                     End If
                 End If
             Next cell
@@ -314,11 +340,48 @@ Private Sub WriteExcelDiff(ByVal ws As Worksheet, ByRef rowNumber As Long, _
     ws.Cells(rowNumber, 10).Value2 = CStr(newItem(3))
     ws.Cells(rowNumber, 11).Value2 = confidence
     ws.Cells(rowNumber, 12).Value2 = key
+    ws.Cells(rowNumber, 13).Value2 = CStr(oldItem(6))
+    ws.Cells(rowNumber, 14).Value2 = CStr(newItem(6))
     rowNumber = rowNumber + 1
 End Sub
 
 Private Function EmptyExcelItem() As Variant
-    EmptyExcelItem = Array("", "", "", "", "", "")
+    EmptyExcelItem = Array("", "", "", "", "", "", "")
+End Function
+
+Private Sub LoadSheetMappings(ByRef oldMappings As Object, ByRef newMappings As Object)
+    Set oldMappings = CreateObject("Scripting.Dictionary")
+    Set newMappings = CreateObject("Scripting.Dictionary")
+    oldMappings.CompareMode = vbTextCompare
+    newMappings.CompareMode = vbTextCompare
+    If Not UDSheetExists(UD_SHEET_MAP) Then Exit Sub
+
+    Dim ws As Worksheet: Set ws = ThisWorkbook.Worksheets(UD_SHEET_MAP)
+    Dim lastRow As Long, rowNumber As Long, oldName As String, newName As String
+    lastRow = ws.Cells(ws.Rows.Count, 1).End(xlUp).Row
+    For rowNumber = 2 To lastRow
+        If IsRuleEnabled(CStr(ws.Cells(rowNumber, 1).Value2)) Then
+            oldName = NormalizeWhitespace(CStr(ws.Cells(rowNumber, 2).Value2))
+            newName = NormalizeWhitespace(CStr(ws.Cells(rowNumber, 3).Value2))
+            If oldName = "" Or newName = "" Then Err.Raise vbObjectError + 704, , _
+                "UD_シート対応表の" & rowNumber & "行目に空欄があります。"
+            If oldMappings.Exists(oldName) Then Err.Raise vbObjectError + 705, , _
+                "過去版シートが重複しています: " & oldName
+            If newMappings.Exists(newName) Then Err.Raise vbObjectError + 706, , _
+                "今回版シートが重複しています: " & newName
+            oldMappings.Add oldName, newName
+            newMappings.Add newName, newName
+        End If
+    Next rowNumber
+End Sub
+
+Private Function ResolveComparisonSheetName(ByVal sourceSheetName As String, _
+                                            ByVal sheetMappings As Object) As String
+    If sheetMappings.Exists(sourceSheetName) Then
+        ResolveComparisonSheetName = CStr(sheetMappings(sourceSheetName))
+    Else
+        ResolveComparisonSheetName = sourceSheetName
+    End If
 End Function
 
 Private Sub CompareConfigFiles(ByVal oldPath As String, ByVal newPath As String)
@@ -462,25 +525,27 @@ Private Sub CreateColoredCopies(ByVal oldPath As String, ByVal newPath As String
     Set newMap = CopySourceSheets(newPath, UD_NEW_PREFIX)
 
     Dim diffSheet As Worksheet: Set diffSheet = ThisWorkbook.Worksheets(UD_EXCEL)
-    Dim lastRow As Long, rowNumber As Long, result As String, sourceSheet As String
+    Dim lastRow As Long, rowNumber As Long, result As String
+    Dim oldSourceSheet As String, newSourceSheet As String
     Dim oldLocation As String, newLocation As String
     lastRow = diffSheet.Cells(diffSheet.Rows.Count, 1).End(xlUp).Row
     For rowNumber = 2 To lastRow
         result = CStr(diffSheet.Cells(rowNumber, 1).Value2)
-        sourceSheet = CStr(diffSheet.Cells(rowNumber, 3).Value2)
+        oldSourceSheet = CStr(diffSheet.Cells(rowNumber, 13).Value2)
+        newSourceSheet = CStr(diffSheet.Cells(rowNumber, 14).Value2)
         oldLocation = CStr(diffSheet.Cells(rowNumber, 5).Value2)
         newLocation = CStr(diffSheet.Cells(rowNumber, 6).Value2)
         Select Case result
             Case "変更", "数式変更"
-                ColorCopiedCell oldMap, sourceSheet, oldLocation, RGB(255, 242, 204)
-                ColorCopiedCell newMap, sourceSheet, newLocation, RGB(255, 242, 204)
+                ColorCopiedCell oldMap, oldSourceSheet, oldLocation, RGB(255, 242, 204)
+                ColorCopiedCell newMap, newSourceSheet, newLocation, RGB(255, 242, 204)
             Case "追加"
-                ColorCopiedCell newMap, sourceSheet, newLocation, RGB(221, 235, 247)
+                ColorCopiedCell newMap, newSourceSheet, newLocation, RGB(221, 235, 247)
             Case "削除"
-                ColorCopiedCell oldMap, sourceSheet, oldLocation, RGB(244, 204, 204)
+                ColorCopiedCell oldMap, oldSourceSheet, oldLocation, RGB(244, 204, 204)
             Case "移動候補"
-                ColorCopiedCell oldMap, sourceSheet, oldLocation, RGB(226, 239, 218)
-                ColorCopiedCell newMap, sourceSheet, newLocation, RGB(226, 239, 218)
+                ColorCopiedCell oldMap, oldSourceSheet, oldLocation, RGB(226, 239, 218)
+                ColorCopiedCell newMap, newSourceSheet, newLocation, RGB(226, 239, 218)
         End Select
     Next rowNumber
     UDLog "INFO", "色付きコピー", _
@@ -721,6 +786,7 @@ Private Sub BuildSummary(ByVal oldBookPath As String, ByVal newBookPath As Strin
     UDSummaryRow ws, rowNumber, "過去設計書", FileNameOnly(oldBookPath)
     UDSummaryRow ws, rowNumber, "今回設計書", FileNameOnly(newBookPath)
     UDSummaryRow ws, rowNumber, "Excel差分件数", CStr(UDDataRowCount(UD_EXCEL))
+    UDSummaryRow ws, rowNumber, "有効なシート対応", CStr(EnabledSheetMappingCount()) & "件"
     UDSummaryRow ws, rowNumber, "色付きコピー", _
         "UD_旧_* と UD_新_* に作成（元ファイルは変更しません）"
     UDSummaryRow ws, rowNumber, "色の凡例", _
@@ -735,6 +801,17 @@ Private Sub BuildSummary(ByVal oldBookPath As String, ByVal newBookPath As Strin
     UDSummaryRow ws, rowNumber, "重要", _
         "差分は候補です。拠点固有値・設定順序・メーカー仕様を人間が最終確認してください。"
 End Sub
+
+Private Function EnabledSheetMappingCount() As Long
+    If Not UDSheetExists(UD_SHEET_MAP) Then Exit Function
+    Dim ws As Worksheet: Set ws = ThisWorkbook.Worksheets(UD_SHEET_MAP)
+    Dim lastRow As Long, rowNumber As Long
+    lastRow = ws.Cells(ws.Rows.Count, 1).End(xlUp).Row
+    For rowNumber = 2 To lastRow
+        If IsRuleEnabled(CStr(ws.Cells(rowNumber, 1).Value2)) Then _
+            EnabledSheetMappingCount = EnabledSheetMappingCount + 1
+    Next rowNumber
+End Function
 
 Private Sub UDSummaryRow(ByVal ws As Worksheet, ByRef rowNumber As Long, _
                          ByVal label As String, ByVal value As String)
@@ -799,7 +876,8 @@ End Sub
 
 Private Sub FormatUniversalSheets()
     Dim sheetName As Variant, ws As Worksheet
-    For Each sheetName In Array(UD_SUMMARY, UD_EXCEL, UD_CONFIG, UD_RULES, UD_LOG)
+    For Each sheetName In Array(UD_SUMMARY, UD_EXCEL, UD_CONFIG, UD_RULES, _
+                                UD_SHEET_MAP, UD_LOG)
         Set ws = ThisWorkbook.Worksheets(CStr(sheetName))
         UDFormatTable ws, ws.Cells(1, ws.Columns.Count).End(xlToLeft).Column
         ws.Cells.VerticalAlignment = xlTop
@@ -815,7 +893,13 @@ Private Sub FormatUniversalSheets()
         .Columns("E:F").ColumnWidth = 18
         .Columns("G:J").ColumnWidth = 32
         .Columns("L").ColumnWidth = 45
+        .Columns("M:N").ColumnWidth = 24
         .Columns("G:J").WrapText = True
+    End With
+    With ThisWorkbook.Worksheets(UD_SHEET_MAP)
+        .Columns("A").ColumnWidth = 10
+        .Columns("B:C").ColumnWidth = 32
+        .Columns("D").ColumnWidth = 55
     End With
     With ThisWorkbook.Worksheets(UD_CONFIG)
         .Columns("A:B").ColumnWidth = 15
