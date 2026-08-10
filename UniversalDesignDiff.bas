@@ -14,6 +14,8 @@ Private Const UD_RULES As String = "UD_比較ルール"
 Private Const UD_LOG As String = "UD_実行ログ"
 Private Const UD_MAX_CELLS As Long = 300000
 Private Const UD_MAX_CONFIG_BYTES As Long = 52428800
+Private Const UD_OLD_PREFIX As String = "UD_旧_"
+Private Const UD_NEW_PREFIX As String = "UD_新_"
 
 Public Sub RunUniversalDiff()
     Dim oldBookPath As Variant, newBookPath As Variant
@@ -66,6 +68,7 @@ Public Sub RunUniversalDiffFromPaths(ByVal oldBookPath As String, _
     UDLog "INFO", "処理開始", "過去=" & FileNameOnly(oldBookPath) & _
           ", 今回=" & FileNameOnly(newBookPath)
     CompareExcelBooks oldBookPath, newBookPath
+    CreateColoredCopies oldBookPath, newBookPath
     If oldConfigPath <> "" And newConfigPath <> "" Then
         CompareConfigFiles oldConfigPath, newConfigPath
     End If
@@ -125,6 +128,7 @@ Private Sub InitializeUniversalRules(ByVal showMessage As Boolean)
 End Sub
 
 Private Sub PrepareUniversalSheets()
+    RemoveColoredCopies
     UDPrepareSheet UD_SUMMARY, Array("項目", "値")
     UDPrepareSheet UD_EXCEL, Array( _
         "判定", "扱い", "シート", "項目候補", "過去場所", "今回場所", _
@@ -441,6 +445,110 @@ Private Sub WriteConfigDiff(ByVal ws As Worksheet, ByRef rowNumber As Long, _
     rowNumber = rowNumber + 1
 End Sub
 
+Private Sub RemoveColoredCopies()
+    Dim index As Long, sheetName As String
+    For index = ThisWorkbook.Worksheets.Count To 1 Step -1
+        sheetName = ThisWorkbook.Worksheets(index).Name
+        If Left$(sheetName, Len(UD_OLD_PREFIX)) = UD_OLD_PREFIX Or _
+           Left$(sheetName, Len(UD_NEW_PREFIX)) = UD_NEW_PREFIX Then
+            ThisWorkbook.Worksheets(index).Delete
+        End If
+    Next index
+End Sub
+
+Private Sub CreateColoredCopies(ByVal oldPath As String, ByVal newPath As String)
+    Dim oldMap As Object, newMap As Object
+    Set oldMap = CopySourceSheets(oldPath, UD_OLD_PREFIX)
+    Set newMap = CopySourceSheets(newPath, UD_NEW_PREFIX)
+
+    Dim diffSheet As Worksheet: Set diffSheet = ThisWorkbook.Worksheets(UD_EXCEL)
+    Dim lastRow As Long, rowNumber As Long, result As String, sourceSheet As String
+    Dim oldLocation As String, newLocation As String
+    lastRow = diffSheet.Cells(diffSheet.Rows.Count, 1).End(xlUp).Row
+    For rowNumber = 2 To lastRow
+        result = CStr(diffSheet.Cells(rowNumber, 1).Value2)
+        sourceSheet = CStr(diffSheet.Cells(rowNumber, 3).Value2)
+        oldLocation = CStr(diffSheet.Cells(rowNumber, 5).Value2)
+        newLocation = CStr(diffSheet.Cells(rowNumber, 6).Value2)
+        Select Case result
+            Case "変更", "数式変更"
+                ColorCopiedCell oldMap, sourceSheet, oldLocation, RGB(255, 242, 204)
+                ColorCopiedCell newMap, sourceSheet, newLocation, RGB(255, 242, 204)
+            Case "追加"
+                ColorCopiedCell newMap, sourceSheet, newLocation, RGB(221, 235, 247)
+            Case "削除"
+                ColorCopiedCell oldMap, sourceSheet, oldLocation, RGB(244, 204, 204)
+            Case "移動候補"
+                ColorCopiedCell oldMap, sourceSheet, oldLocation, RGB(226, 239, 218)
+                ColorCopiedCell newMap, sourceSheet, newLocation, RGB(226, 239, 218)
+        End Select
+    Next rowNumber
+    UDLog "INFO", "色付きコピー", _
+        "過去シート=" & oldMap.Count & ", 今回シート=" & newMap.Count
+End Sub
+
+Private Function CopySourceSheets(ByVal workbookPath As String, _
+                                  ByVal prefix As String) As Object
+    Dim result As Object: Set result = CreateObject("Scripting.Dictionary")
+    Dim sourceBook As Workbook, sourceSheet As Worksheet, copiedSheet As Worksheet
+    Dim targetName As String
+    On Error GoTo ErrorHandler
+    Set sourceBook = Workbooks.Open(workbookPath, UpdateLinks:=0, ReadOnly:=True, _
+                                   AddToMru:=False, IgnoreReadOnlyRecommended:=True)
+    For Each sourceSheet In sourceBook.Worksheets
+        If ResolveExcelHandling(sourceSheet.Name, "") <> "比較除外" Then
+            sourceSheet.Copy After:=ThisWorkbook.Worksheets(ThisWorkbook.Worksheets.Count)
+            Set copiedSheet = ThisWorkbook.Worksheets(ThisWorkbook.Worksheets.Count)
+            targetName = MakeUniqueSheetName(prefix & sourceSheet.Name)
+            copiedSheet.Name = targetName
+            result(sourceSheet.Name) = targetName
+        End If
+    Next sourceSheet
+    sourceBook.Close SaveChanges:=False
+    Set CopySourceSheets = result
+    Exit Function
+ErrorHandler:
+    Dim number As Long, description As String
+    number = Err.Number: description = Err.Description
+    On Error Resume Next
+    If Not sourceBook Is Nothing Then sourceBook.Close SaveChanges:=False
+    On Error GoTo 0
+    Err.Raise number, , description
+End Function
+
+Private Function MakeUniqueSheetName(ByVal proposedName As String) As String
+    Dim result As String, baseName As String, suffix As String
+    Dim sequence As Long, invalid As Variant
+    baseName = proposedName
+    For Each invalid In Array(":", "\", "/", "?", "*", "[", "]")
+        baseName = Replace(baseName, CStr(invalid), "_")
+    Next invalid
+    result = Left$(baseName, 31)
+    If Not UDSheetExists(result) Then MakeUniqueSheetName = result: Exit Function
+    sequence = 2
+    Do
+        suffix = "_" & CStr(sequence)
+        result = Left$(baseName, 31 - Len(suffix)) & suffix
+        sequence = sequence + 1
+    Loop While UDSheetExists(result)
+    MakeUniqueSheetName = result
+End Function
+
+Private Sub ColorCopiedCell(ByVal sheetMap As Object, ByVal sourceSheet As String, _
+                            ByVal address As String, ByVal colorValue As Long)
+    If address = "" Or Not sheetMap.Exists(sourceSheet) Then Exit Sub
+    Dim target As Range
+    On Error Resume Next
+    Set target = ThisWorkbook.Worksheets(CStr(sheetMap(sourceSheet))).Range(address)
+    On Error GoTo 0
+    If target Is Nothing Then Exit Sub
+    If target.MergeCells Then
+        target.MergeArea.Interior.Color = colorValue
+    Else
+        target.Interior.Color = colorValue
+    End If
+End Sub
+
 Private Function DisplayConfigKey(ByVal comparisonKey As String) As String
     Dim position As Long: position = InStr(comparisonKey, ChrW(&H1F))
     If position > 0 Then
@@ -613,6 +721,10 @@ Private Sub BuildSummary(ByVal oldBookPath As String, ByVal newBookPath As Strin
     UDSummaryRow ws, rowNumber, "過去設計書", FileNameOnly(oldBookPath)
     UDSummaryRow ws, rowNumber, "今回設計書", FileNameOnly(newBookPath)
     UDSummaryRow ws, rowNumber, "Excel差分件数", CStr(UDDataRowCount(UD_EXCEL))
+    UDSummaryRow ws, rowNumber, "色付きコピー", _
+        "UD_旧_* と UD_新_* に作成（元ファイルは変更しません）"
+    UDSummaryRow ws, rowNumber, "色の凡例", _
+        "変更=黄、追加=青、削除=赤、移動候補=緑"
     If oldConfigPath <> "" Then
         UDSummaryRow ws, rowNumber, "過去Config", FileNameOnly(oldConfigPath)
         UDSummaryRow ws, rowNumber, "今回Config", FileNameOnly(newConfigPath)
