@@ -1,5 +1,14 @@
 # FortiGate Network Design Checker
 
+## 汎用Diff版
+
+SW、AP、ルータ、Firewallなど、機器種別を問わず過去・今回の詳細設計書とConfigを比較するVBA版を追加しました。
+
+- [`UniversalDesignDiff.bas`](./UniversalDesignDiff.bas)
+- [`汎用Diffの導入・仕様`](./UNIVERSAL_DIFF_README.md)
+
+FortiGate固有の意味的な設計書・Config照合は、引き続き`FG60_SelfContained.bas`を使用します。
+
 FortiGateの詳細設計書Excelにある「ネットワーク」シートと、FortiGate configの`config system interface`をExcel VBAだけで照合する試作ツールです。
 
 Python、PowerShell、外部ライブラリ、外部通信は使用しません。
