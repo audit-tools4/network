@@ -1,6 +1,6 @@
 # FortiGate Network Design Checker
 
-FortiGateの詳細設計書Excelにある「ネットワーク」シートと、FortiGate configの`config system interface`をExcel VBAだけで照合する試作ツールです。
+FortiGateの詳細設計書Excelにある「ネットワーク」「ルーティング」シートと、FortiGate configをExcel VBAだけで照合する試作ツールです。
 
 Python、PowerShell、外部ライブラリ、外部通信は使用しません。
 
@@ -17,6 +17,12 @@ Python、PowerShell、外部ライブラリ、外部通信は使用しません�
 9. `FG_比較結果`シートを確認する。
 
 `.bas`ファイルをダウンロードする必要はありません。GitHubのコード表示からコピーして貼り付けられます。
+
+ファイル選択画面を使わずテストする場合は、VBAのイミディエイトウィンドウから次の形でも実行できます。
+
+```vb
+RunChecksFromPaths "C:\test\design.xlsx", "C:\test\fortigate.conf", True
+```
 
 ## 初期対象
 
@@ -37,6 +43,20 @@ Python、PowerShell、外部ライブラリ、外部通信は使用しません�
 
 config側は`config system interface`を解析します。
 
+「ルーティング」シートからはIPv4スタティックルートを抽出し、`config router static`と照合します。
+
+- VDOM
+- 宛先サブネット
+- ゲートウェイ
+- インターフェース
+- アドミニストレーティブディスタンス
+- コメント
+- ステータス
+
+設計書にはFortiGateの`edit`番号がないため、`宛先 + ゲートウェイ + インターフェース`を経路の識別キーにします。CIDR表記（例：`0.0.0.0/0`）とFortiOSのIP・マスク表記（例：`0.0.0.0 0.0.0.0`）は同じ形式に正規化します。
+
+「ルーティング」シートがない設計書では、警告を実行ログへ記録してインターフェース照合のみ続行します。
+
 ## 判定
 
 - `一致`
@@ -56,6 +76,7 @@ config側は`config system interface`を解析します。
 - Explicit Web／FTP Proxy
 - アウトバンドシェイピング
 - SD-WAN、IPsec、Firewall Policy
+- BGP（シートには記載がありますが、今回の追加対象はIPv4スタティックルートです）
 
 ## 安全性
 
@@ -66,4 +87,4 @@ config側は`config system interface`を解析します。
 
 ## 注意
 
-これは初期版です。本番利用前に匿名化した設計書とconfigで動作確認し、意図的な不一致を正しく検出できることを確認してください。
+これは初期版です。本番利用前に匿名化した設計書とconfigで動作確認し、意図的な不一致を正しく検出できることを確認してください。特にVDOM構成では、`config vdom`を含むバックアップconfigで確認してください。
