@@ -1,0 +1,1095 @@
+Option Explicit
+
+' ============================================================
+' 汎用 詳細設計書／Config Diff
+' - FortiGate、SW、APなど機器種別に依存しないExcelセル比較
+' - 任意のテキストConfigの追加／削除比較
+' - 外部通信、Python、Java、外部ライブラリ不要
+' ============================================================
+
+Private Const UD_SUMMARY As String = "UD_サマリ"
+Private Const UD_EXCEL As String = "UD_Excel差分"
+Private Const UD_CONFIG As String = "UD_Config差分"
+Private Const UD_RULES As String = "UD_比較ルール"
+Private Const UD_SHEET_MAP As String = "UD_シート対応表"
+Private Const UD_LOG As String = "UD_実行ログ"
+Private Const UD_MAX_CELLS As Long = 300000
+Private Const UD_MAX_CONFIG_BYTES As Long = 52428800
+Private Const UD_OLD_PREFIX As String = "UD_旧_"
+Private Const UD_NEW_PREFIX As String = "UD_新_"
+Private udAutomaticSheetPairCount As Long
+
+Public Sub RunUniversalDiff()
+    Dim oldBookPath As Variant, newBookPath As Variant
+    Dim oldConfigPath As Variant, newConfigPath As Variant
+
+    oldBookPath = Application.GetOpenFilename( _
+        "Excel,*.xlsx;*.xlsm;*.xls", , "過去の詳細設計書を選択")
+    If VarType(oldBookPath) = vbBoolean Then Exit Sub
+
+    newBookPath = Application.GetOpenFilename( _
+        "Excel,*.xlsx;*.xlsm;*.xls", , "今回の詳細設計書を選択")
+    If VarType(newBookPath) = vbBoolean Then Exit Sub
+
+    oldConfigPath = ""
+    newConfigPath = ""
+    If MsgBox("Configも比較しますか？", vbYesNo + vbQuestion) = vbYes Then
+        oldConfigPath = Application.GetOpenFilename( _
+            "Config,*.conf;*.cfg;*.txt;*.*", , "過去Configを選択")
+        If VarType(oldConfigPath) = vbBoolean Then Exit Sub
+        newConfigPath = Application.GetOpenFilename( _
+            "Config,*.conf;*.cfg;*.txt;*.*", , "今回Configを選択")
+        If VarType(newConfigPath) = vbBoolean Then Exit Sub
+    End If
+
+    RunUniversalDiffFromPaths CStr(oldBookPath), CStr(newBookPath), _
+        CStr(oldConfigPath), CStr(newConfigPath), True
+End Sub
+
+Public Sub RunUniversalDiffFromPaths(ByVal oldBookPath As String, _
+                                     ByVal newBookPath As String, _
+                                     Optional ByVal oldConfigPath As String = "", _
+                                     Optional ByVal newConfigPath As String = "", _
+                                     Optional ByVal showMessage As Boolean = True)
+    Dim oldScreen As Boolean, oldEvents As Boolean, oldAlerts As Boolean
+    Dim oldCalculation As XlCalculation, oldSecurity As Long
+    oldScreen = Application.ScreenUpdating
+    oldEvents = Application.EnableEvents
+    oldAlerts = Application.DisplayAlerts
+    oldCalculation = Application.Calculation
+    oldSecurity = Application.AutomationSecurity
+
+    Application.ScreenUpdating = False
+    Application.EnableEvents = False
+    Application.DisplayAlerts = False
+    Application.Calculation = xlCalculationManual
+    Application.AutomationSecurity = 3
+    On Error GoTo ErrorHandler
+
+    PrepareUniversalSheets
+    UDLog "INFO", "処理開始", "過去=" & FileNameOnly(oldBookPath) & _
+          ", 今回=" & FileNameOnly(newBookPath)
+    CompareExcelBooks oldBookPath, newBookPath
+    CreateColoredCopies oldBookPath, newBookPath
+    If oldConfigPath <> "" And newConfigPath <> "" Then
+        CompareConfigFiles oldConfigPath, newConfigPath
+    End If
+    BuildSummary oldBookPath, newBookPath, oldConfigPath, newConfigPath
+    FormatUniversalSheets
+    ArrangeOutputSheets
+    If showMessage Then MsgBox _
+        "比較が完了しました。左側の色付き比較シートを確認してください。", vbInformation
+
+CleanExit:
+    Application.AutomationSecurity = oldSecurity
+    Application.Calculation = oldCalculation
+    Application.DisplayAlerts = oldAlerts
+    Application.EnableEvents = oldEvents
+    Application.ScreenUpdating = oldScreen
+    Exit Sub
+
+ErrorHandler:
+    UDLog "ERROR", "処理中断", Err.Number & ": " & Err.Description
+    If showMessage Then MsgBox "比較中にエラーが発生しました。" & vbCrLf & _
+                               Err.Description, vbExclamation
+    Resume CleanExit
+End Sub
+
+Public Sub ResetUniversalRules()
+    InitializeUniversalRules True
+End Sub
+
+Public Sub ResetSheetMappings()
+    InitializeSheetMappings True
+End Sub
+
+Private Sub InitializeSheetMappings(ByVal showMessage As Boolean)
+    Dim ws As Worksheet
+    Set ws = UDGetOrCreateSheet(UD_SHEET_MAP)
+    If ws.AutoFilterMode Then ws.AutoFilterMode = False
+    ws.Cells.Clear
+    UDWriteHeaders ws, Array("有効", "過去版シート名", "今回版シート名", "用途・説明")
+    ws.Cells(2, 4).Value2 = _
+        "順番で対応できない場合だけ登録。未登録の残りは左から順番に比較"
+    UDFormatTable ws, 4
+    If showMessage Then _
+        MsgBox "UD_シート対応表を初期化しました。過去版と今回版のシート名を登録してください。", vbInformation
+End Sub
+
+Private Sub InitializeUniversalRules(ByVal showMessage As Boolean)
+    Dim ws As Worksheet
+    Set ws = UDGetOrCreateSheet(UD_RULES)
+    If ws.AutoFilterMode Then ws.AutoFilterMode = False
+    ws.Cells.Clear
+    UDWriteHeaders ws, Array("有効", "対象", "シート/ファイル", "項目/文言", _
+                             "処理", "説明")
+    Dim defaults As Variant, r As Long, c As Long
+    defaults = Array( _
+        Array("○", "Excel", "表紙", "*", "比較除外", "表紙全体を除外"), _
+        Array("○", "Excel", "改訂履歴", "*", "比較除外", "改訂履歴を除外"), _
+        Array("○", "Excel", "*", "作成日", "拠点差分", "日付変更を重点対象外にする"), _
+        Array("○", "Excel", "*", "ホスト名", "拠点差分", "拠点ごとに異なる値"), _
+        Array("○", "Excel", "*", "管理IP", "拠点差分", "拠点ごとに異なる値"), _
+        Array("○", "Config", "*", "password", "秘密情報", "値をマスク"), _
+        Array("○", "Config", "*", "secret", "秘密情報", "値をマスク"), _
+        Array("○", "Config", "*", "psk", "秘密情報", "値をマスク"), _
+        Array("○", "Config", "*", "community", "秘密情報", "値をマスク"), _
+        Array("○", "Config", "*", "private-key", "秘密情報", "値をマスク"), _
+        Array("○", "Config", "*", "token", "秘密情報", "値をマスク"), _
+        Array("○", "Config", "*", "certificate", "秘密情報", "値をマスク"))
+    For r = LBound(defaults) To UBound(defaults)
+        For c = LBound(defaults(r)) To UBound(defaults(r))
+            ws.Cells(r + 2, c + 1).Value2 = defaults(r)(c)
+        Next c
+    Next r
+    UDFormatTable ws, 6
+    If showMessage Then _
+        MsgBox "UD_比較ルールを初期化しました。必要に応じて編集してください。", vbInformation
+End Sub
+
+Private Sub PrepareUniversalSheets()
+    RemoveColoredCopies
+    UDPrepareSheet UD_SUMMARY, Array("項目", "値")
+    UDPrepareSheet UD_EXCEL, Array( _
+        "判定", "扱い", "シート", "項目候補", "過去場所", "今回場所", _
+        "過去値", "今回値", "過去数式", "今回数式", "確度", "キー", _
+        "過去シート", "今回シート")
+    UDPrepareSheet UD_CONFIG, Array( _
+        "判定", "扱い", "正規化行", "過去行", "今回行", _
+        "過去内容", "今回内容", "秘密情報", "キー")
+    UDPrepareSheet UD_LOG, Array("日時", "レベル", "処理", "内容")
+    If Not UDSheetExists(UD_RULES) Then InitializeUniversalRules False
+    If Not UDSheetExists(UD_SHEET_MAP) Then InitializeSheetMappings False
+End Sub
+
+Private Sub CompareExcelBooks(ByVal oldPath As String, ByVal newPath As String)
+    Dim oldIndex As Object, newIndex As Object
+    Dim oldSheetMap As Object, newSheetMap As Object
+    BuildEffectiveSheetMappings oldPath, newPath, oldSheetMap, newSheetMap
+    Set oldIndex = LoadWorkbookIndex(oldPath, oldSheetMap)
+    Set newIndex = LoadWorkbookIndex(newPath, newSheetMap)
+
+    Dim matchedOld As Object, matchedNew As Object, oldByValue As Object
+    Set matchedOld = CreateObject("Scripting.Dictionary")
+    Set matchedNew = CreateObject("Scripting.Dictionary")
+    Set oldByValue = CreateObject("Scripting.Dictionary")
+
+    Dim ws As Worksheet, outputRow As Long, key As Variant
+    Dim oldItem As Variant, newItem As Variant, result As String, handling As String
+    Set ws = ThisWorkbook.Worksheets(UD_EXCEL)
+    outputRow = 2
+
+    ' 同じシート・セルで完全に同じものだけを先に確定する。
+    ' 値が異なるセルは、行挿入による移動の可能性があるため後で判定する。
+    For Each key In newIndex.Keys
+        If oldIndex.Exists(CStr(key)) Then
+            oldItem = oldIndex(CStr(key))
+            newItem = newIndex(CStr(key))
+            handling = ResolveExcelHandling(CStr(newItem(0)), CStr(newItem(5)))
+            If handling = "比較除外" Then
+                matchedOld(CStr(key)) = True
+                matchedNew(CStr(key)) = True
+            ElseIf CStr(oldItem(2)) = CStr(newItem(2)) Then
+                matchedOld(CStr(key)) = True
+                matchedNew(CStr(key)) = True
+                If CStr(oldItem(3)) <> CStr(newItem(3)) Then
+                    WriteExcelDiff ws, outputRow, "数式変更", handling, oldItem, newItem, _
+                                   "高", CStr(key)
+                End If
+            End If
+        End If
+    Next key
+
+    ' 未対応の旧セルを正規化値ごとに索引化し、移動候補を探す。
+    For Each key In oldIndex.Keys
+        If Not matchedOld.Exists(CStr(key)) Then
+            oldItem = oldIndex(CStr(key))
+            If CStr(oldItem(2)) <> "" Then AddCollectionItem oldByValue, _
+                CStr(oldItem(0)) & "|" & AddressColumn(CStr(oldItem(1))) & "|" & _
+                CStr(oldItem(2)), CStr(key)
+        End If
+    Next key
+
+    Dim candidateKey As String, oldLocationKey As String
+    For Each key In newIndex.Keys
+        If Not matchedNew.Exists(CStr(key)) Then
+            newItem = newIndex(CStr(key))
+            candidateKey = CStr(newItem(0)) & "|" & _
+                           AddressColumn(CStr(newItem(1))) & "|" & CStr(newItem(2))
+            handling = ResolveExcelHandling(CStr(newItem(0)), CStr(newItem(5)))
+            If handling = "比較除外" Then
+                matchedNew(CStr(key)) = True
+            ElseIf oldByValue.Exists(candidateKey) Then
+                If oldByValue(candidateKey).Count > 0 Then
+                    oldLocationKey = CStr(oldByValue(candidateKey)(1))
+                    oldByValue(candidateKey).Remove 1
+                    oldItem = oldIndex(oldLocationKey)
+                    matchedOld(oldLocationKey) = True
+                    matchedNew(CStr(key)) = True
+                    WriteExcelDiff ws, outputRow, "移動候補", handling, oldItem, _
+                                   newItem, "中", oldLocationKey & "->" & CStr(key)
+                End If
+            End If
+        End If
+    Next key
+
+    ' 移動ではなかった同一場所の残余を変更として扱う。
+    For Each key In newIndex.Keys
+        If Not matchedNew.Exists(CStr(key)) And oldIndex.Exists(CStr(key)) Then
+            If Not matchedOld.Exists(CStr(key)) Then
+                oldItem = oldIndex(CStr(key))
+                newItem = newIndex(CStr(key))
+                handling = ResolveExcelHandling(CStr(newItem(0)), CStr(newItem(5)))
+                matchedOld(CStr(key)) = True
+                matchedNew(CStr(key)) = True
+                If handling <> "比較除外" Then
+                    WriteExcelDiff ws, outputRow, "変更", handling, oldItem, _
+                                   newItem, "高", CStr(key)
+                End If
+            End If
+        End If
+    Next key
+
+    For Each key In newIndex.Keys
+        If Not matchedNew.Exists(CStr(key)) Then
+            newItem = newIndex(CStr(key))
+            handling = ResolveExcelHandling(CStr(newItem(0)), CStr(newItem(5)))
+            If handling <> "比較除外" Then
+                WriteExcelDiff ws, outputRow, "追加", handling, EmptyExcelItem(), _
+                               newItem, "高", CStr(key)
+            End If
+        End If
+    Next key
+
+    For Each key In oldIndex.Keys
+        If Not matchedOld.Exists(CStr(key)) Then
+            oldItem = oldIndex(CStr(key))
+            handling = ResolveExcelHandling(CStr(oldItem(0)), CStr(oldItem(5)))
+            If handling <> "比較除外" Then
+                WriteExcelDiff ws, outputRow, "削除", handling, oldItem, _
+                               EmptyExcelItem(), "高", CStr(key)
+            End If
+        End If
+    Next key
+    UDLog "INFO", "Excel比較", "差分=" & (outputRow - 2)
+End Sub
+
+Private Function LoadWorkbookIndex(ByVal workbookPath As String, _
+                                   ByVal sheetMappings As Object) As Object
+    Dim result As Object: Set result = CreateObject("Scripting.Dictionary")
+    Dim sourceBook As Workbook, ws As Worksheet, used As Range, cell As Range
+    Dim totalCells As Double, key As String, value As String, formula As String
+    Dim address As String, label As String, item As Variant, comparisonSheet As String
+    On Error GoTo ErrorHandler
+    Set sourceBook = Workbooks.Open(workbookPath, UpdateLinks:=0, ReadOnly:=True, _
+                                   AddToMru:=False, IgnoreReadOnlyRecommended:=True)
+    For Each ws In sourceBook.Worksheets
+        Set used = ws.UsedRange
+        totalCells = totalCells + CDbl(used.Cells.CountLarge)
+        If totalCells > UD_MAX_CELLS Then
+            Err.Raise vbObjectError + 701, , _
+                "比較セル数が上限を超えました。不要シートを比較ルールで除外するか、UsedRangeを整理してください。"
+        End If
+        If ResolveExcelHandling(ws.Name, "") <> "比較除外" Then
+            comparisonSheet = ResolveComparisonSheetName(ws.Name, sheetMappings)
+            For Each cell In used.Cells
+                If IsMergeAnchor(cell) Then
+                    value = NormalizeCellValue(cell.Value2)
+                    formula = NormalizeCellValue(cell.Formula)
+                    If value <> "" Or formula <> "" Then
+                        address = cell.Address(False, False)
+                        label = FindRowLabel(ws, cell.Row, cell.Column)
+                        key = comparisonSheet & "|" & address
+                        item = Array(comparisonSheet, address, value, formula, _
+                                     CellDisplayValue(cell), label, ws.Name)
+                        If result.Exists(key) Then Err.Raise vbObjectError + 703, , _
+                            "シート対応後の比較キーが重複しました: " & key & _
+                            "。UD_シート対応表を確認してください。"
+                        result.Add key, item
+                    End If
+                End If
+            Next cell
+        End If
+    Next ws
+    sourceBook.Close SaveChanges:=False
+    Set LoadWorkbookIndex = result
+    Exit Function
+
+ErrorHandler:
+    Dim number As Long, description As String
+    number = Err.Number: description = Err.Description
+    On Error Resume Next
+    If Not sourceBook Is Nothing Then sourceBook.Close SaveChanges:=False
+    On Error GoTo 0
+    Err.Raise number, , description
+End Function
+
+Private Sub WriteExcelDiff(ByVal ws As Worksheet, ByRef rowNumber As Long, _
+                           ByVal result As String, ByVal handling As String, _
+                           ByVal oldItem As Variant, ByVal newItem As Variant, _
+                           ByVal confidence As String, ByVal key As String)
+    Dim sheetName As String, label As String
+    sheetName = CStr(newItem(0)): If sheetName = "" Then sheetName = CStr(oldItem(0))
+    label = CStr(newItem(5)): If label = "" Then label = CStr(oldItem(5))
+    ws.Cells(rowNumber, 1).Value2 = result
+    ws.Cells(rowNumber, 2).Value2 = handling
+    ws.Cells(rowNumber, 3).Value2 = sheetName
+    ws.Cells(rowNumber, 4).Value2 = label
+    ws.Cells(rowNumber, 5).Value2 = CStr(oldItem(1))
+    ws.Cells(rowNumber, 6).Value2 = CStr(newItem(1))
+    ws.Cells(rowNumber, 7).Value2 = CStr(oldItem(4))
+    ws.Cells(rowNumber, 8).Value2 = CStr(newItem(4))
+    ws.Cells(rowNumber, 9).Value2 = CStr(oldItem(3))
+    ws.Cells(rowNumber, 10).Value2 = CStr(newItem(3))
+    ws.Cells(rowNumber, 11).Value2 = confidence
+    ws.Cells(rowNumber, 12).Value2 = key
+    ws.Cells(rowNumber, 13).Value2 = CStr(oldItem(6))
+    ws.Cells(rowNumber, 14).Value2 = CStr(newItem(6))
+    rowNumber = rowNumber + 1
+End Sub
+
+Private Function EmptyExcelItem() As Variant
+    EmptyExcelItem = Array("", "", "", "", "", "", "")
+End Function
+
+Private Sub BuildEffectiveSheetMappings(ByVal oldPath As String, ByVal newPath As String, _
+                                        ByRef oldMappings As Object, _
+                                        ByRef newMappings As Object)
+    Set oldMappings = CreateObject("Scripting.Dictionary")
+    Set newMappings = CreateObject("Scripting.Dictionary")
+    oldMappings.CompareMode = vbTextCompare
+    newMappings.CompareMode = vbTextCompare
+    udAutomaticSheetPairCount = 0
+    Dim ws As Worksheet
+    Dim lastRow As Long, rowNumber As Long, oldName As String, newName As String
+    If UDSheetExists(UD_SHEET_MAP) Then
+        Set ws = ThisWorkbook.Worksheets(UD_SHEET_MAP)
+        lastRow = ws.Cells(ws.Rows.Count, 1).End(xlUp).Row
+        For rowNumber = 2 To lastRow
+            If IsRuleEnabled(CStr(ws.Cells(rowNumber, 1).Value2)) Then
+                oldName = NormalizeWhitespace(CStr(ws.Cells(rowNumber, 2).Value2))
+                newName = NormalizeWhitespace(CStr(ws.Cells(rowNumber, 3).Value2))
+                If oldName = "" Or newName = "" Then Err.Raise vbObjectError + 704, , _
+                    "UD_シート対応表の" & rowNumber & "行目に空欄があります。"
+                If oldMappings.Exists(oldName) Then Err.Raise vbObjectError + 705, , _
+                    "過去版シートが重複しています: " & oldName
+                If newMappings.Exists(newName) Then Err.Raise vbObjectError + 706, , _
+                    "今回版シートが重複しています: " & newName
+                oldMappings.Add oldName, newName
+                newMappings.Add newName, newName
+            End If
+        Next rowNumber
+    End If
+
+    Dim oldSheets As Collection, newSheets As Collection
+    Set oldSheets = EligibleSheetNames(oldPath)
+    Set newSheets = EligibleSheetNames(newPath)
+    ValidateExplicitMappings oldSheets, newSheets, oldMappings, newMappings
+
+    Dim oldRemaining As Collection, newRemaining As Collection
+    Set oldRemaining = UnmappedSheetNames(oldSheets, oldMappings)
+    Set newRemaining = UnmappedSheetNames(newSheets, newMappings)
+    Dim pairCount As Long, index As Long
+    pairCount = oldRemaining.Count
+    If newRemaining.Count < pairCount Then pairCount = newRemaining.Count
+    For index = 1 To pairCount
+        oldName = CStr(oldRemaining(index))
+        newName = CStr(newRemaining(index))
+        oldMappings.Add oldName, newName
+        newMappings.Add newName, newName
+    Next index
+    udAutomaticSheetPairCount = pairCount
+    UDLog "INFO", "シート対応", _
+        "明示=" & EnabledSheetMappingCount() & ", 順番=" & pairCount
+End Sub
+
+Private Function EligibleSheetNames(ByVal workbookPath As String) As Collection
+    Dim result As New Collection, sourceBook As Workbook, ws As Worksheet
+    On Error GoTo ErrorHandler
+    Set sourceBook = Workbooks.Open(workbookPath, UpdateLinks:=0, ReadOnly:=True, _
+                                   AddToMru:=False, IgnoreReadOnlyRecommended:=True)
+    For Each ws In sourceBook.Worksheets
+        If ResolveExcelHandling(ws.Name, "") <> "比較除外" Then result.Add ws.Name
+    Next ws
+    sourceBook.Close SaveChanges:=False
+    Set EligibleSheetNames = result
+    Exit Function
+ErrorHandler:
+    Dim number As Long, description As String
+    number = Err.Number: description = Err.Description
+    On Error Resume Next
+    If Not sourceBook Is Nothing Then sourceBook.Close SaveChanges:=False
+    On Error GoTo 0
+    Err.Raise number, , description
+End Function
+
+Private Function UnmappedSheetNames(ByVal sourceNames As Collection, _
+                                    ByVal mappings As Object) As Collection
+    Dim result As New Collection, index As Long, sheetName As String
+    For index = 1 To sourceNames.Count
+        sheetName = CStr(sourceNames(index))
+        If Not mappings.Exists(sheetName) Then result.Add sheetName
+    Next index
+    Set UnmappedSheetNames = result
+End Function
+
+Private Sub ValidateExplicitMappings(ByVal oldSheets As Collection, _
+                                     ByVal newSheets As Collection, _
+                                     ByVal oldMappings As Object, _
+                                     ByVal newMappings As Object)
+    Dim availableOld As Object, availableNew As Object
+    Set availableOld = CollectionNameSet(oldSheets)
+    Set availableNew = CollectionNameSet(newSheets)
+    Dim key As Variant
+    For Each key In oldMappings.Keys
+        If Not availableOld.Exists(CStr(key)) Then Err.Raise vbObjectError + 707, , _
+            "対応表の過去版シートが見つかりません: " & CStr(key)
+        If Not availableNew.Exists(CStr(oldMappings(key))) Then Err.Raise vbObjectError + 708, , _
+            "対応表の今回版シートが見つかりません: " & CStr(oldMappings(key))
+    Next key
+End Sub
+
+Private Function CollectionNameSet(ByVal sourceNames As Collection) As Object
+    Dim result As Object: Set result = CreateObject("Scripting.Dictionary")
+    result.CompareMode = vbTextCompare
+    Dim index As Long
+    For index = 1 To sourceNames.Count
+        result(CStr(sourceNames(index))) = True
+    Next index
+    Set CollectionNameSet = result
+End Function
+
+Private Function ResolveComparisonSheetName(ByVal sourceSheetName As String, _
+                                            ByVal sheetMappings As Object) As String
+    If sheetMappings.Exists(sourceSheetName) Then
+        ResolveComparisonSheetName = CStr(sheetMappings(sourceSheetName))
+    Else
+        ResolveComparisonSheetName = sourceSheetName
+    End If
+End Function
+
+Private Sub CompareConfigFiles(ByVal oldPath As String, ByVal newPath As String)
+    Dim oldLines As Object, newLines As Object
+    Set oldLines = LoadConfigLines(oldPath)
+    Set newLines = LoadConfigLines(newPath)
+
+    Dim ws As Worksheet, outputRow As Long, key As Variant
+    Dim oldCount As Long, newCount As Long, index As Long
+    Set ws = ThisWorkbook.Worksheets(UD_CONFIG)
+    outputRow = 2
+
+    For Each key In oldLines.Keys
+        oldCount = oldLines(key).Count
+        If newLines.Exists(CStr(key)) Then newCount = newLines(key).Count Else newCount = 0
+        If oldCount > newCount Then
+            For index = newCount + 1 To oldCount
+                WriteConfigDiff ws, outputRow, "削除", CStr(key), _
+                    CStr(oldLines(key)(index)), "", CStr(key)
+            Next index
+        End If
+    Next key
+
+    For Each key In newLines.Keys
+        newCount = newLines(key).Count
+        If oldLines.Exists(CStr(key)) Then oldCount = oldLines(key).Count Else oldCount = 0
+        If newCount > oldCount Then
+            For index = oldCount + 1 To newCount
+                WriteConfigDiff ws, outputRow, "追加", CStr(key), "", _
+                    CStr(newLines(key)(index)), CStr(key)
+            Next index
+        End If
+    Next key
+    UDLog "INFO", "Config比較", "差分=" & (outputRow - 2)
+End Sub
+
+Private Function LoadConfigLines(ByVal filePath As String) As Object
+    Dim result As Object: Set result = CreateObject("Scripting.Dictionary")
+    Dim fileNo As Integer, lineText As String, lineNumber As Long
+    Dim normalized As String, handling As String, stored As String
+    Dim comparisonKey As String
+    Dim content As String, lines As Variant, index As Long, fileLength As Long
+    On Error GoTo ErrorHandler
+    fileNo = FreeFile
+    Open filePath For Binary Access Read As #fileNo
+    fileLength = LOF(fileNo)
+    If fileLength > UD_MAX_CONFIG_BYTES Then
+        Err.Raise vbObjectError + 702, , "Configが50MBの上限を超えています。"
+    End If
+    If fileLength > 0 Then
+        content = Space$(fileLength)
+        Get #fileNo, , content
+    End If
+    Close #fileNo
+    fileNo = 0
+    content = Replace(content, vbCrLf, vbLf)
+    content = Replace(content, vbCr, vbLf)
+    lines = Split(content, vbLf)
+    For index = LBound(lines) To UBound(lines)
+        lineNumber = index + 1
+        lineText = CStr(lines(index))
+        normalized = NormalizeConfigLine(lineText)
+        If normalized <> "" Then
+            handling = ResolveConfigHandling(FileNameOnly(filePath), normalized)
+            If handling <> "比較除外" Then
+                comparisonKey = normalized
+                If handling = "秘密情報" Then
+                    comparisonKey = MaskSensitiveLine(normalized) & ChrW(&H1F) & _
+                                    SensitiveSignature(normalized)
+                    normalized = MaskSensitiveLine(normalized)
+                End If
+                stored = CStr(lineNumber) & "|" & MaskSensitiveLine(Trim$(lineText))
+                AddCollectionItem result, comparisonKey, stored
+            End If
+        End If
+    Next index
+    Set LoadConfigLines = result
+    Exit Function
+ErrorHandler:
+    Dim number As Long, description As String
+    number = Err.Number: description = Err.Description
+    On Error Resume Next
+    If fileNo > 0 Then Close #fileNo
+    On Error GoTo 0
+    Err.Raise number, , description
+End Function
+
+Private Function AddressColumn(ByVal address As String) As String
+    Dim index As Long, character As String
+    For index = 1 To Len(address)
+        character = Mid$(address, index, 1)
+        If character Like "[A-Za-z]" Then
+            AddressColumn = AddressColumn & UCase$(character)
+        Else
+            Exit For
+        End If
+    Next index
+End Function
+
+Private Sub WriteConfigDiff(ByVal ws As Worksheet, ByRef rowNumber As Long, _
+                            ByVal result As String, ByVal normalized As String, _
+                            ByVal oldStored As String, ByVal newStored As String, _
+                            ByVal key As String)
+    Dim oldLine As String, oldText As String, newLine As String, newText As String
+    SplitStoredLine oldStored, oldLine, oldText
+    SplitStoredLine newStored, newLine, newText
+    Dim handling As String, isSensitive As Boolean
+    isSensitive = (InStr(normalized, ChrW(&H1F)) > 0)
+    normalized = DisplayConfigKey(normalized)
+    If isSensitive Then
+        handling = "秘密情報"
+    Else
+        handling = ResolveConfigHandling("*", normalized)
+    End If
+    ws.Cells(rowNumber, 1).Value2 = result
+    ws.Cells(rowNumber, 2).Value2 = handling
+    ws.Cells(rowNumber, 3).Value2 = normalized
+    ws.Cells(rowNumber, 4).Value2 = oldLine
+    ws.Cells(rowNumber, 5).Value2 = newLine
+    ws.Cells(rowNumber, 6).Value2 = oldText
+    ws.Cells(rowNumber, 7).Value2 = newText
+    ws.Cells(rowNumber, 8).Value2 = IIf(handling = "秘密情報", "マスク済み", "")
+    ws.Cells(rowNumber, 9).Value2 = DisplayConfigKey(key)
+    rowNumber = rowNumber + 1
+End Sub
+
+Private Sub RemoveColoredCopies()
+    Dim index As Long, sheetName As String
+    For index = ThisWorkbook.Worksheets.Count To 1 Step -1
+        sheetName = ThisWorkbook.Worksheets(index).Name
+        If Left$(sheetName, Len(UD_OLD_PREFIX)) = UD_OLD_PREFIX Or _
+           Left$(sheetName, Len(UD_NEW_PREFIX)) = UD_NEW_PREFIX Then
+            ThisWorkbook.Worksheets(index).Delete
+        End If
+    Next index
+End Sub
+
+Private Sub CreateColoredCopies(ByVal oldPath As String, ByVal newPath As String)
+    Dim oldMap As Object, newMap As Object
+    Set oldMap = CopySourceSheets(oldPath, UD_OLD_PREFIX)
+    Set newMap = CopySourceSheets(newPath, UD_NEW_PREFIX)
+
+    Dim diffSheet As Worksheet: Set diffSheet = ThisWorkbook.Worksheets(UD_EXCEL)
+    Dim lastRow As Long, rowNumber As Long, result As String
+    Dim oldSourceSheet As String, newSourceSheet As String
+    Dim oldLocation As String, newLocation As String
+    lastRow = diffSheet.Cells(diffSheet.Rows.Count, 1).End(xlUp).Row
+    For rowNumber = 2 To lastRow
+        result = CStr(diffSheet.Cells(rowNumber, 1).Value2)
+        oldSourceSheet = CStr(diffSheet.Cells(rowNumber, 13).Value2)
+        newSourceSheet = CStr(diffSheet.Cells(rowNumber, 14).Value2)
+        oldLocation = CStr(diffSheet.Cells(rowNumber, 5).Value2)
+        newLocation = CStr(diffSheet.Cells(rowNumber, 6).Value2)
+        Select Case result
+            Case "変更", "数式変更"
+                ColorCopiedCell oldMap, oldSourceSheet, oldLocation, RGB(255, 242, 204)
+                ColorCopiedCell newMap, newSourceSheet, newLocation, RGB(255, 242, 204)
+            Case "追加"
+                ColorCopiedCell newMap, newSourceSheet, newLocation, RGB(221, 235, 247)
+            Case "削除"
+                ColorCopiedCell oldMap, oldSourceSheet, oldLocation, RGB(244, 204, 204)
+            Case "移動候補"
+                ColorCopiedCell oldMap, oldSourceSheet, oldLocation, RGB(226, 239, 218)
+                ColorCopiedCell newMap, newSourceSheet, newLocation, RGB(226, 239, 218)
+        End Select
+    Next rowNumber
+    UDLog "INFO", "色付きコピー", _
+        "過去シート=" & oldMap.Count & ", 今回シート=" & newMap.Count
+End Sub
+
+Private Function CopySourceSheets(ByVal workbookPath As String, _
+                                  ByVal prefix As String) As Object
+    Dim result As Object: Set result = CreateObject("Scripting.Dictionary")
+    Dim sourceBook As Workbook, sourceSheet As Worksheet, copiedSheet As Worksheet
+    Dim targetName As String
+    On Error GoTo ErrorHandler
+    Set sourceBook = Workbooks.Open(workbookPath, UpdateLinks:=0, ReadOnly:=True, _
+                                   AddToMru:=False, IgnoreReadOnlyRecommended:=True)
+    For Each sourceSheet In sourceBook.Worksheets
+        If ResolveExcelHandling(sourceSheet.Name, "") <> "比較除外" Then
+            sourceSheet.Copy After:=ThisWorkbook.Worksheets(ThisWorkbook.Worksheets.Count)
+            Set copiedSheet = ThisWorkbook.Worksheets(ThisWorkbook.Worksheets.Count)
+            targetName = MakeUniqueSheetName(prefix & sourceSheet.Name)
+            copiedSheet.Name = targetName
+            result(sourceSheet.Name) = targetName
+        End If
+    Next sourceSheet
+    sourceBook.Close SaveChanges:=False
+    Set CopySourceSheets = result
+    Exit Function
+ErrorHandler:
+    Dim number As Long, description As String
+    number = Err.Number: description = Err.Description
+    On Error Resume Next
+    If Not sourceBook Is Nothing Then sourceBook.Close SaveChanges:=False
+    On Error GoTo 0
+    Err.Raise number, , description
+End Function
+
+Private Function MakeUniqueSheetName(ByVal proposedName As String) As String
+    Dim result As String, baseName As String, suffix As String
+    Dim sequence As Long, invalid As Variant
+    baseName = proposedName
+    For Each invalid In Array(":", "\", "/", "?", "*", "[", "]")
+        baseName = Replace(baseName, CStr(invalid), "_")
+    Next invalid
+    result = Left$(baseName, 31)
+    If Not UDSheetExists(result) Then MakeUniqueSheetName = result: Exit Function
+    sequence = 2
+    Do
+        suffix = "_" & CStr(sequence)
+        result = Left$(baseName, 31 - Len(suffix)) & suffix
+        sequence = sequence + 1
+    Loop While UDSheetExists(result)
+    MakeUniqueSheetName = result
+End Function
+
+Private Sub ColorCopiedCell(ByVal sheetMap As Object, ByVal sourceSheet As String, _
+                            ByVal address As String, ByVal colorValue As Long)
+    If address = "" Or Not sheetMap.Exists(sourceSheet) Then Exit Sub
+    Dim target As Range
+    On Error Resume Next
+    Set target = ThisWorkbook.Worksheets(CStr(sheetMap(sourceSheet))).Range(address)
+    On Error GoTo 0
+    If target Is Nothing Then Exit Sub
+    If target.MergeCells Then
+        target.MergeArea.Interior.Color = colorValue
+    Else
+        target.Interior.Color = colorValue
+    End If
+End Sub
+
+Private Function DisplayConfigKey(ByVal comparisonKey As String) As String
+    Dim position As Long: position = InStr(comparisonKey, ChrW(&H1F))
+    If position > 0 Then
+        DisplayConfigKey = Left$(comparisonKey, position - 1)
+    Else
+        DisplayConfigKey = comparisonKey
+    End If
+End Function
+
+Private Function SensitiveSignature(ByVal value As String) As String
+    Dim hashValue As Double, index As Long
+    hashValue = 5381
+    For index = 1 To Len(value)
+        hashValue = hashValue * 33 + AscW(Mid$(value, index, 1))
+        hashValue = hashValue - Int(hashValue / 2000000000#) * 2000000000#
+    Next index
+    SensitiveSignature = Hex$(CLng(hashValue))
+End Function
+
+Private Sub SplitStoredLine(ByVal stored As String, ByRef lineNumber As String, _
+                            ByRef lineText As String)
+    Dim position As Long: position = InStr(stored, "|")
+    If position > 0 Then
+        lineNumber = Left$(stored, position - 1)
+        lineText = Mid$(stored, position + 1)
+    End If
+End Sub
+
+Private Function NormalizeConfigLine(ByVal value As String) As String
+    Dim result As String
+    result = NormalizeWhitespace(value)
+    If result = "" Then Exit Function
+    If Left$(result, 1) = "#" Or Left$(result, 1) = "!" Then Exit Function
+    NormalizeConfigLine = LCase$(result)
+End Function
+
+Private Function MaskSensitiveLine(ByVal value As String) As String
+    If ResolveConfigHandling("*", value) <> "秘密情報" Then
+        MaskSensitiveLine = value
+        Exit Function
+    End If
+    Dim firstSpace As Long, secondSpace As Long
+    firstSpace = InStr(value, " ")
+    If firstSpace > 0 Then secondSpace = InStr(firstSpace + 1, value, " ")
+    If secondSpace > 0 Then
+        MaskSensitiveLine = Left$(value, secondSpace - 1) & " ********"
+    ElseIf firstSpace > 0 Then
+        MaskSensitiveLine = Left$(value, firstSpace - 1) & " ********"
+    Else
+        MaskSensitiveLine = "********"
+    End If
+End Function
+
+Private Function ResolveExcelHandling(ByVal sheetName As String, _
+                                      ByVal context As String) As String
+    ResolveExcelHandling = ResolveRule("Excel", sheetName, context, "一致必須")
+End Function
+
+Private Function ResolveConfigHandling(ByVal fileName As String, _
+                                       ByVal lineText As String) As String
+    ResolveConfigHandling = ResolveRule("Config", fileName, lineText, "通常比較")
+End Function
+
+Private Function ResolveRule(ByVal target As String, ByVal container As String, _
+                             ByVal text As String, ByVal defaultAction As String) As String
+    ResolveRule = defaultAction
+    If Not UDSheetExists(UD_RULES) Then Exit Function
+    Dim ws As Worksheet: Set ws = ThisWorkbook.Worksheets(UD_RULES)
+    Dim lastRow As Long, rowNumber As Long
+    lastRow = ws.Cells(ws.Rows.Count, 1).End(xlUp).Row
+    For rowNumber = 2 To lastRow
+        If IsRuleEnabled(CStr(ws.Cells(rowNumber, 1).Value2)) _
+           And LCase$(NormalizeWhitespace(CStr(ws.Cells(rowNumber, 2).Value2))) = LCase$(target) Then
+            If WildcardMatch(container, CStr(ws.Cells(rowNumber, 3).Value2)) And _
+               ContainsPattern(text, CStr(ws.Cells(rowNumber, 4).Value2)) Then
+                ResolveRule = NormalizeWhitespace(CStr(ws.Cells(rowNumber, 5).Value2))
+                Exit Function
+            End If
+        End If
+    Next rowNumber
+End Function
+
+Private Function IsRuleEnabled(ByVal value As String) As Boolean
+    Select Case LCase$(NormalizeWhitespace(value))
+        Case "○", "on", "yes", "true", "1", "有効"
+            IsRuleEnabled = True
+    End Select
+End Function
+
+Private Function WildcardMatch(ByVal value As String, ByVal pattern As String) As Boolean
+    pattern = NormalizeWhitespace(pattern)
+    If pattern = "" Or pattern = "*" Then WildcardMatch = True: Exit Function
+    WildcardMatch = (LCase$(value) Like LCase$(pattern))
+End Function
+
+Private Function ContainsPattern(ByVal value As String, ByVal pattern As String) As Boolean
+    pattern = NormalizeWhitespace(pattern)
+    If pattern = "" Or pattern = "*" Then ContainsPattern = True: Exit Function
+    ContainsPattern = (InStr(1, value, pattern, vbTextCompare) > 0)
+End Function
+
+Private Function FindRowLabel(ByVal ws As Worksheet, ByVal rowNumber As Long, _
+                              ByVal valueColumn As Long) As String
+    Dim columnNumber As Long, candidate As String
+    For columnNumber = valueColumn - 1 To 1 Step -1
+        candidate = NormalizeCellValue(ReadMergeAnchor(ws.Cells(rowNumber, columnNumber)).Value2)
+        If candidate <> "" Then FindRowLabel = candidate: Exit Function
+    Next columnNumber
+End Function
+
+Private Function IsMergeAnchor(ByVal cell As Range) As Boolean
+    If Not cell.MergeCells Then
+        IsMergeAnchor = True
+    Else
+        IsMergeAnchor = (cell.Address = cell.MergeArea.Cells(1, 1).Address)
+    End If
+End Function
+
+Private Function ReadMergeAnchor(ByVal cell As Range) As Range
+    If cell.MergeCells Then
+        Set ReadMergeAnchor = cell.MergeArea.Cells(1, 1)
+    Else
+        Set ReadMergeAnchor = cell
+    End If
+End Function
+
+Private Function CellDisplayValue(ByVal cell As Range) As String
+    On Error Resume Next
+    CellDisplayValue = NormalizeWhitespace(CStr(cell.Text))
+    If Err.Number <> 0 Then Err.Clear: CellDisplayValue = NormalizeCellValue(cell.Value2)
+    On Error GoTo 0
+End Function
+
+Private Function NormalizeCellValue(ByVal value As Variant) As String
+    If IsError(value) Or IsEmpty(value) Then Exit Function
+    NormalizeCellValue = NormalizeWhitespace(CStr(value))
+End Function
+
+Private Function NormalizeWhitespace(ByVal value As String) As String
+    Dim result As String
+    result = Replace(value, ChrW(&H3000), " ")
+    result = Replace(result, vbCrLf, " ")
+    result = Replace(result, vbCr, " ")
+    result = Replace(result, vbLf, " ")
+    result = Replace(result, vbTab, " ")
+    result = Trim$(result)
+    Do While InStr(result, "  ") > 0
+        result = Replace(result, "  ", " ")
+    Loop
+    NormalizeWhitespace = result
+End Function
+
+Private Sub AddCollectionItem(ByVal dictionary As Object, ByVal key As String, _
+                              ByVal value As String)
+    Dim items As Collection
+    If dictionary.Exists(key) Then
+        Set items = dictionary(key)
+    Else
+        Set items = New Collection
+        dictionary.Add key, items
+    End If
+    items.Add value
+End Sub
+
+Private Sub BuildSummary(ByVal oldBookPath As String, ByVal newBookPath As String, _
+                         ByVal oldConfigPath As String, ByVal newConfigPath As String)
+    Dim ws As Worksheet: Set ws = ThisWorkbook.Worksheets(UD_SUMMARY)
+    Dim rowNumber As Long: rowNumber = 2
+    UDSummaryRow ws, rowNumber, "実行日時", Format$(Now, "yyyy/mm/dd hh:nn:ss")
+    UDSummaryRow ws, rowNumber, "過去設計書", FileNameOnly(oldBookPath)
+    UDSummaryRow ws, rowNumber, "今回設計書", FileNameOnly(newBookPath)
+    UDSummaryRow ws, rowNumber, "Excel差分件数", CStr(UDDataRowCount(UD_EXCEL))
+    UDSummaryRow ws, rowNumber, "有効なシート対応", CStr(EnabledSheetMappingCount()) & "件"
+    UDSummaryRow ws, rowNumber, "順番による自動対応", CStr(udAutomaticSheetPairCount) & "組"
+    UDSummaryRow ws, rowNumber, "色付きコピー", _
+        "UD_旧_* と UD_新_* に作成（元ファイルは変更しません）"
+    UDSummaryRow ws, rowNumber, "色の凡例", _
+        "変更=黄、追加=青、削除=赤、移動候補=緑"
+    If oldConfigPath <> "" Then
+        UDSummaryRow ws, rowNumber, "過去Config", FileNameOnly(oldConfigPath)
+        UDSummaryRow ws, rowNumber, "今回Config", FileNameOnly(newConfigPath)
+        UDSummaryRow ws, rowNumber, "Config差分件数", CStr(UDDataRowCount(UD_CONFIG))
+    Else
+        UDSummaryRow ws, rowNumber, "Config比較", "未実施"
+    End If
+    UDSummaryRow ws, rowNumber, "重要", _
+        "差分は候補です。拠点固有値・設定順序・メーカー仕様を人間が最終確認してください。"
+End Sub
+
+Private Function EnabledSheetMappingCount() As Long
+    If Not UDSheetExists(UD_SHEET_MAP) Then Exit Function
+    Dim ws As Worksheet: Set ws = ThisWorkbook.Worksheets(UD_SHEET_MAP)
+    Dim lastRow As Long, rowNumber As Long
+    lastRow = ws.Cells(ws.Rows.Count, 1).End(xlUp).Row
+    For rowNumber = 2 To lastRow
+        If IsRuleEnabled(CStr(ws.Cells(rowNumber, 1).Value2)) Then _
+            EnabledSheetMappingCount = EnabledSheetMappingCount + 1
+    Next rowNumber
+End Function
+
+Private Sub UDSummaryRow(ByVal ws As Worksheet, ByRef rowNumber As Long, _
+                         ByVal label As String, ByVal value As String)
+    ws.Cells(rowNumber, 1).Value2 = label
+    ws.Cells(rowNumber, 2).Value2 = value
+    rowNumber = rowNumber + 1
+End Sub
+
+Private Function UDDataRowCount(ByVal sheetName As String) As Long
+    Dim ws As Worksheet: Set ws = ThisWorkbook.Worksheets(sheetName)
+    UDDataRowCount = Application.Max(0, ws.Cells(ws.Rows.Count, 1).End(xlUp).Row - 1)
+End Function
+
+Private Sub UDPrepareSheet(ByVal sheetName As String, ByVal headers As Variant)
+    Dim ws As Worksheet: Set ws = UDGetOrCreateSheet(sheetName)
+    ws.Visible = xlSheetVisible
+    If ws.AutoFilterMode Then ws.AutoFilterMode = False
+    ws.Cells.Clear
+    UDWriteHeaders ws, headers
+End Sub
+
+Private Sub UDWriteHeaders(ByVal ws As Worksheet, ByVal headers As Variant)
+    Dim index As Long
+    For index = LBound(headers) To UBound(headers)
+        ws.Cells(1, index + 1).Value2 = CStr(headers(index))
+    Next index
+End Sub
+
+Private Function UDGetOrCreateSheet(ByVal sheetName As String) As Worksheet
+    On Error Resume Next
+    Set UDGetOrCreateSheet = ThisWorkbook.Worksheets(sheetName)
+    On Error GoTo 0
+    If UDGetOrCreateSheet Is Nothing Then
+        Set UDGetOrCreateSheet = ThisWorkbook.Worksheets.Add( _
+            After:=ThisWorkbook.Worksheets(ThisWorkbook.Worksheets.Count))
+        UDGetOrCreateSheet.Name = sheetName
+    End If
+End Function
+
+Private Function UDSheetExists(ByVal sheetName As String) As Boolean
+    Dim ws As Worksheet
+    On Error Resume Next
+    Set ws = ThisWorkbook.Worksheets(sheetName)
+    On Error GoTo 0
+    UDSheetExists = Not ws Is Nothing
+End Function
+
+Private Sub UDFormatTable(ByVal ws As Worksheet, ByVal columnCount As Long)
+    With ws.Range(ws.Cells(1, 1), ws.Cells(1, columnCount))
+        .Font.Bold = True
+        .Font.Color = RGB(255, 255, 255)
+        .Interior.Color = RGB(31, 78, 121)
+        .AutoFilter
+    End With
+    ws.Rows(1).RowHeight = 24
+    ws.Rows(1).VerticalAlignment = xlCenter
+    ws.Columns.AutoFit
+    ws.Activate
+    ActiveWindow.SplitColumn = 0
+    ActiveWindow.SplitRow = 1
+    ActiveWindow.FreezePanes = True
+End Sub
+
+Private Sub FormatUniversalSheets()
+    Dim sheetName As Variant, ws As Worksheet
+    For Each sheetName In Array(UD_SUMMARY, UD_EXCEL, UD_CONFIG, UD_RULES, _
+                                UD_SHEET_MAP, UD_LOG)
+        Set ws = ThisWorkbook.Worksheets(CStr(sheetName))
+        UDFormatTable ws, ws.Cells(1, ws.Columns.Count).End(xlToLeft).Column
+        ws.Cells.VerticalAlignment = xlTop
+        ws.Cells.WrapText = False
+    Next sheetName
+    With ThisWorkbook.Worksheets(UD_SUMMARY)
+        .Columns("A").ColumnWidth = 22
+        .Columns("B").ColumnWidth = 80
+        .Columns("B").WrapText = True
+    End With
+    With ThisWorkbook.Worksheets(UD_EXCEL)
+        .Columns("A:D").ColumnWidth = 16
+        .Columns("E:F").ColumnWidth = 18
+        .Columns("G:J").ColumnWidth = 32
+        .Columns("L").ColumnWidth = 45
+        .Columns("M:N").ColumnWidth = 24
+        .Columns("G:J").WrapText = True
+    End With
+    With ThisWorkbook.Worksheets(UD_SHEET_MAP)
+        .Columns("A").ColumnWidth = 10
+        .Columns("B:C").ColumnWidth = 32
+        .Columns("D").ColumnWidth = 55
+    End With
+    With ThisWorkbook.Worksheets(UD_CONFIG)
+        .Columns("A:B").ColumnWidth = 15
+        .Columns("C").ColumnWidth = 55
+        .Columns("F:G").ColumnWidth = 55
+        .Columns("C:G").WrapText = True
+    End With
+    ApplyResultColors ThisWorkbook.Worksheets(UD_EXCEL)
+    ApplyResultColors ThisWorkbook.Worksheets(UD_CONFIG)
+End Sub
+
+Private Sub ArrangeOutputSheets()
+    Dim coloredNames As New Collection, ws As Worksheet
+    Dim index As Long, sheetName As String
+
+    For Each ws In ThisWorkbook.Worksheets
+        sheetName = ws.Name
+        If Left$(sheetName, Len(UD_OLD_PREFIX)) = UD_OLD_PREFIX Or _
+           Left$(sheetName, Len(UD_NEW_PREFIX)) = UD_NEW_PREFIX Then
+            coloredNames.Add sheetName
+        End If
+    Next ws
+
+    ' 現在の並びを保ったまま、色付きの過去版・今回版を左端へ移動する。
+    For index = coloredNames.Count To 1 Step -1
+        ThisWorkbook.Worksheets(CStr(coloredNames(index))).Move _
+            Before:=ThisWorkbook.Worksheets(1)
+    Next index
+
+    ' 管理用シートは右端へまとめる。
+    MoveSheetToRight UD_SUMMARY
+    MoveSheetToRight UD_LOG
+    MoveSheetToRight UD_RULES
+    MoveSheetToRight UD_SHEET_MAP
+    MoveSheetToRight UD_EXCEL
+    MoveSheetToRight UD_CONFIG
+
+    ' 詳細差分は着色処理の内部データとして残すが、通常画面では表示しない。
+    ThisWorkbook.Worksheets(UD_EXCEL).Visible = xlSheetVeryHidden
+    ThisWorkbook.Worksheets(UD_CONFIG).Visible = xlSheetVeryHidden
+    HideUnusedBlankSheets
+
+    If coloredNames.Count > 0 Then _
+        ThisWorkbook.Worksheets(CStr(coloredNames(1))).Activate
+End Sub
+
+Private Sub MoveSheetToRight(ByVal sheetName As String)
+    If Not UDSheetExists(sheetName) Then Exit Sub
+    ThisWorkbook.Worksheets(sheetName).Move _
+        After:=ThisWorkbook.Worksheets(ThisWorkbook.Worksheets.Count)
+End Sub
+
+Private Sub HideUnusedBlankSheets()
+    Dim ws As Worksheet, sheetName As String
+    For Each ws In ThisWorkbook.Worksheets
+        sheetName = ws.Name
+        If Not IsUniversalSheet(sheetName) And _
+           Left$(sheetName, Len(UD_OLD_PREFIX)) <> UD_OLD_PREFIX And _
+           Left$(sheetName, Len(UD_NEW_PREFIX)) <> UD_NEW_PREFIX Then
+            If ws.UsedRange.Cells.CountLarge = 1 And _
+               NormalizeCellValue(ws.Cells(1, 1).Value2) = "" Then
+                ws.Visible = xlSheetHidden
+            End If
+        End If
+    Next ws
+End Sub
+
+Private Function IsUniversalSheet(ByVal sheetName As String) As Boolean
+    Select Case sheetName
+        Case UD_SUMMARY, UD_EXCEL, UD_CONFIG, UD_RULES, UD_SHEET_MAP, UD_LOG
+            IsUniversalSheet = True
+    End Select
+End Function
+
+Private Sub ApplyResultColors(ByVal ws As Worksheet)
+    Dim lastRow As Long, rowNumber As Long, result As String
+    lastRow = ws.Cells(ws.Rows.Count, 1).End(xlUp).Row
+    For rowNumber = 2 To lastRow
+        result = CStr(ws.Cells(rowNumber, 1).Value2)
+        Select Case result
+            Case "追加": ws.Cells(rowNumber, 1).Interior.Color = RGB(221, 235, 247)
+            Case "削除": ws.Cells(rowNumber, 1).Interior.Color = RGB(244, 204, 204)
+            Case "変更", "数式変更": _
+                ws.Cells(rowNumber, 1).Interior.Color = RGB(255, 242, 204)
+            Case "移動候補": ws.Cells(rowNumber, 1).Interior.Color = RGB(226, 239, 218)
+        End Select
+    Next rowNumber
+End Sub
+
+Private Sub UDLog(ByVal level As String, ByVal operation As String, _
+                  ByVal detail As String)
+    Dim ws As Worksheet: Set ws = UDGetOrCreateSheet(UD_LOG)
+    If ws.Cells(1, 1).Value2 = "" Then _
+        UDWriteHeaders ws, Array("日時", "レベル", "処理", "内容")
+    Dim nextRow As Long: nextRow = ws.Cells(ws.Rows.Count, 1).End(xlUp).Row + 1
+    ws.Cells(nextRow, 1).Value = Now
+    ws.Cells(nextRow, 1).NumberFormat = "yyyy/mm/dd hh:mm:ss"
+    ws.Cells(nextRow, 2).Value2 = level
+    ws.Cells(nextRow, 3).Value2 = operation
+    ws.Cells(nextRow, 4).Value2 = detail
+End Sub
+
+Private Function FileNameOnly(ByVal filePath As String) As String
+    Dim position As Long
+    position = InStrRev(filePath, Application.PathSeparator)
+    If position > 0 Then FileNameOnly = Mid$(filePath, position + 1) Else FileNameOnly = filePath
+End Function
