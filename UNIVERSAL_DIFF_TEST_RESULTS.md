@@ -29,10 +29,10 @@ Excel上で`UniversalDesignDiff.bas`を取り込み、`RunUniversalDiffFromPaths
 修正版VBAはMicrosoft Excel上で最後まで実行でき、以下のシートを生成しました。
 
 - `UD_サマリ`
-- `UD_Excel差分`
-- `UD_Config差分`
 - `UD_比較ルール`
 - `UD_実行ログ`
+
+`UD_Excel差分`と`UD_Config差分`は内部データとして生成されますが、通常画面では非表示です。
 
 ## FG60形式テスト
 
@@ -56,6 +56,15 @@ Excel上で`UniversalDesignDiff.bas`を取り込み、`RunUniversalDiffFromPaths
 - 過去版・今回版の色付きコピーで変更セルを黄色表示
 - 数式エラーなし
 - FG60の同名シート比較は従来と同じ9件を維持
+
+## 出力シート配置テスト
+
+- 左端1番目：`UD_旧_東京_社員SSID`
+- 左端2番目：`UD_新_大阪_業務SSID`
+- 初期表示：旧版の色付きシート
+- サマリ、実行ログ、比較ルール、シート対応表：右側へ配置
+- Excel差分、Config差分：VeryHiddenで非表示
+- 空の初期シート：非表示
 
 複数インターフェースは、セル単位で変更、追加、削除、移動候補として表示されます。行を途中へ追加した場合、後続行の同一値は移動候補になります。
 

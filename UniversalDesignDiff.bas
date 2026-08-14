@@ -76,8 +76,9 @@ Public Sub RunUniversalDiffFromPaths(ByVal oldBookPath As String, _
     End If
     BuildSummary oldBookPath, newBookPath, oldConfigPath, newConfigPath
     FormatUniversalSheets
-    ThisWorkbook.Worksheets(UD_SUMMARY).Activate
-    If showMessage Then MsgBox "比較が完了しました。UD_サマリを確認してください。", vbInformation
+    ArrangeOutputSheets
+    If showMessage Then MsgBox _
+        "比較が完了しました。左側の色付き比較シートを確認してください。", vbInformation
 
 CleanExit:
     Application.AutomationSecurity = oldSecurity
@@ -108,7 +109,8 @@ Private Sub InitializeSheetMappings(ByVal showMessage As Boolean)
     If ws.AutoFilterMode Then ws.AutoFilterMode = False
     ws.Cells.Clear
     UDWriteHeaders ws, Array("有効", "過去版シート名", "今回版シート名", "用途・説明")
-    ws.Cells(2, 4).Value2 = "異なるシート名を対応させる場合だけ登録。未登録は同名シートで比較"
+    ws.Cells(2, 4).Value2 = _
+        "順番で対応できない場合だけ登録。未登録の残りは左から順番に比較"
     UDFormatTable ws, 4
     If showMessage Then _
         MsgBox "UD_シート対応表を初期化しました。過去版と今回版のシート名を登録してください。", vbInformation
@@ -910,6 +912,7 @@ End Function
 
 Private Sub UDPrepareSheet(ByVal sheetName As String, ByVal headers As Variant)
     Dim ws As Worksheet: Set ws = UDGetOrCreateSheet(sheetName)
+    ws.Visible = xlSheetVisible
     If ws.AutoFilterMode Then ws.AutoFilterMode = False
     ws.Cells.Clear
     UDWriteHeaders ws, headers
@@ -993,6 +996,69 @@ Private Sub FormatUniversalSheets()
     ApplyResultColors ThisWorkbook.Worksheets(UD_EXCEL)
     ApplyResultColors ThisWorkbook.Worksheets(UD_CONFIG)
 End Sub
+
+Private Sub ArrangeOutputSheets()
+    Dim coloredNames As New Collection, ws As Worksheet
+    Dim index As Long, sheetName As String
+
+    For Each ws In ThisWorkbook.Worksheets
+        sheetName = ws.Name
+        If Left$(sheetName, Len(UD_OLD_PREFIX)) = UD_OLD_PREFIX Or _
+           Left$(sheetName, Len(UD_NEW_PREFIX)) = UD_NEW_PREFIX Then
+            coloredNames.Add sheetName
+        End If
+    Next ws
+
+    ' 現在の並びを保ったまま、色付きの過去版・今回版を左端へ移動する。
+    For index = coloredNames.Count To 1 Step -1
+        ThisWorkbook.Worksheets(CStr(coloredNames(index))).Move _
+            Before:=ThisWorkbook.Worksheets(1)
+    Next index
+
+    ' 管理用シートは右端へまとめる。
+    MoveSheetToRight UD_SUMMARY
+    MoveSheetToRight UD_LOG
+    MoveSheetToRight UD_RULES
+    MoveSheetToRight UD_SHEET_MAP
+    MoveSheetToRight UD_EXCEL
+    MoveSheetToRight UD_CONFIG
+
+    ' 詳細差分は着色処理の内部データとして残すが、通常画面では表示しない。
+    ThisWorkbook.Worksheets(UD_EXCEL).Visible = xlSheetVeryHidden
+    ThisWorkbook.Worksheets(UD_CONFIG).Visible = xlSheetVeryHidden
+    HideUnusedBlankSheets
+
+    If coloredNames.Count > 0 Then _
+        ThisWorkbook.Worksheets(CStr(coloredNames(1))).Activate
+End Sub
+
+Private Sub MoveSheetToRight(ByVal sheetName As String)
+    If Not UDSheetExists(sheetName) Then Exit Sub
+    ThisWorkbook.Worksheets(sheetName).Move _
+        After:=ThisWorkbook.Worksheets(ThisWorkbook.Worksheets.Count)
+End Sub
+
+Private Sub HideUnusedBlankSheets()
+    Dim ws As Worksheet, sheetName As String
+    For Each ws In ThisWorkbook.Worksheets
+        sheetName = ws.Name
+        If Not IsUniversalSheet(sheetName) And _
+           Left$(sheetName, Len(UD_OLD_PREFIX)) <> UD_OLD_PREFIX And _
+           Left$(sheetName, Len(UD_NEW_PREFIX)) <> UD_NEW_PREFIX Then
+            If ws.UsedRange.Cells.CountLarge = 1 And _
+               NormalizeCellValue(ws.Cells(1, 1).Value2) = "" Then
+                ws.Visible = xlSheetHidden
+            End If
+        End If
+    Next ws
+End Sub
+
+Private Function IsUniversalSheet(ByVal sheetName As String) As Boolean
+    Select Case sheetName
+        Case UD_SUMMARY, UD_EXCEL, UD_CONFIG, UD_RULES, UD_SHEET_MAP, UD_LOG
+            IsUniversalSheet = True
+    End Select
+End Function
 
 Private Sub ApplyResultColors(ByVal ws As Worksheet)
     Dim lastRow As Long, rowNumber As Long, result As String
